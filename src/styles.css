@@ -1,0 +1,165 @@
+/* Global app chrome + color system. Imported after Mantine's reset so these win.
+   Canonical palette + roles live in docs/design-system.md. */
+:root {
+  --uep-bg: #eef3f2; /* screen canvas - same value as --uep-surface-sunken, kept as an independent literal */
+  --uep-surface: #ffffff; /* cards, bars, table */
+  --uep-surface-sunken: #eef3f2; /* table headers, inset panels */
+  --uep-border: #dae1df;
+  --uep-border-strong: #c4cfcc;
+  --uep-divider: #e6ecea;
+  --uep-hover: #edf7cf; /* row / entry hover fill - lime soft (accentSoft) */
+  --uep-active: #d4ec8f; /* selected / pressed - stronger lime (accentSoftBorder) */
+  --uep-accent: #a2d729; /* Yellow Green - active, hover accent bar */
+  --uep-secondary: #342e37; /* Shadow Grey - secondary (variant=default) button fill */
+  --uep-secondary-hover: #423a47;
+  --uep-secondary-border: #342e37;
+  --uep-secondary-fg: #ffffff;
+  --uep-text: #1a1a1a;
+  --uep-text-muted: #474747;
+  --uep-text-dim: #6e6e6e;
+}
+
+/* Dark scheme - Shadow-Grey near-black; mirrors the `dark` palette in
+   ui/tokens.ts (keep in sync). Mantine sets data-mantine-color-scheme on <html>; these
+   override the vars for raw CSS (the JS `tokens` object is swapped separately). */
+[data-mantine-color-scheme="dark"] {
+  --uep-bg: #3f3944; /* screen canvas - same value as --uep-surface-sunken, kept as an independent literal */
+  --uep-surface: #342e37;
+  --uep-surface-sunken: #3f3944;
+  --uep-border: #4d4653;
+  --uep-border-strong: #5e5666;
+  --uep-divider: #3a343f;
+  --uep-hover: #2b3310;
+  --uep-active: #4f5e1d;
+  --uep-accent: #a8da2e; /* Yellow Green brightened on dark */
+  --uep-secondary: #4a4350; /* lifted Shadow Grey - secondary button fill on dark */
+  --uep-secondary-hover: #564f5d;
+  --uep-secondary-border: #4a4350;
+  --uep-secondary-fg: #ffffff;
+  --uep-text: #ebebeb;
+  --uep-text-muted: #c4c4c4;
+  --uep-text-dim: #9a9a9a;
+}
+
+/* Point Mantine's default text vars at our grayscale so components with no explicit
+   `c=` (Title/Text defaults, c="dimmed", Select/combobox values) match the palette.
+   Must match Mantine's own `:root[data-mantine-color-scheme=…]` specificity (0,2,0);
+   our sheet loads after Mantine's so equal specificity wins. */
+:root[data-mantine-color-scheme="light"] {
+  --mantine-color-text: #1a1a1a;
+  --mantine-color-dimmed: #474747;
+}
+:root[data-mantine-color-scheme="dark"] {
+  --mantine-color-text: #ebebeb;
+  --mantine-color-dimmed: #c4c4c4;
+}
+
+body {
+  background-color: var(--uep-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Selectable list rows - clear hover fill + ink left-accent bar (see design-system.md). */
+.uep-row {
+  transition: background-color 90ms ease;
+}
+.uep-row:hover {
+  background-color: var(--uep-hover);
+}
+.uep-row:hover > td:first-child,
+.uep-row:hover > *:first-child {
+  box-shadow: inset 3px 0 0 0 var(--uep-accent);
+}
+/* A ticked (selected) entry rests at the lighter hover fill; hovering a selected entry
+   "magnifies" to the stronger `active` fill. (The live/building row also uses `active`.)
+   `.uep-row--selected:hover` (0,2,1) outranks `.uep-row:hover` (0,1,1), so it wins. */
+.uep-row--selected {
+  background-color: var(--uep-hover);
+}
+.uep-row--selected:hover {
+  background-color: var(--uep-active);
+}
+
+/* Clickable path text inside a row - underline on hover signals it opens the folder. */
+.uep-path-link {
+  cursor: pointer;
+}
+.uep-path-link:hover {
+  text-decoration: underline;
+}
+
+/* Destructive menu item (e.g. Remove from recents): red text + icon at rest, inverting
+   to white on a solid-red fill when hovered/keyboard-active. The icon inherits via
+   currentColor. (Our sheet is unlayered, so it beats Mantine's layered item styles.) */
+.uep-menu-item-danger {
+  color: var(--mantine-color-red-6);
+}
+.uep-menu-item-danger:hover,
+.uep-menu-item-danger[data-hovered] {
+  background-color: var(--mantine-color-red-6);
+  color: #fff;
+}
+
+/* Generic non-table hoverable entry. */
+.uep-hoverable {
+  transition: background-color 90ms ease;
+}
+.uep-hoverable:hover {
+  background-color: var(--uep-hover);
+}
+
+/* Clickable chart segment - darken slightly on hover to signal it's interactive. */
+.uep-seg {
+  cursor: pointer;
+  transition: filter 90ms ease;
+}
+.uep-seg:hover {
+  filter: brightness(0.9);
+}
+
+/* Slim grayscale scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #c4cfcc transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #c4cfcc;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #a9b6b3;
+  background-clip: content-box;
+}
+[data-mantine-color-scheme="dark"] * {
+  scrollbar-color: #5e5666 transparent;
+}
+[data-mantine-color-scheme="dark"] *::-webkit-scrollbar-thumb {
+  background: #5e5666;
+  background-clip: content-box;
+}
+[data-mantine-color-scheme="dark"] *::-webkit-scrollbar-thumb:hover {
+  background: #6e6676;
+  background-clip: content-box;
+}
+
+/* Chrome-y UI shouldn't be text-selectable; opt back in for log/mono regions. */
+.uep-chrome {
+  user-select: none;
+}
+.uep-selectable {
+  user-select: text;
+}
+
+/* Live-console cursor (Build Logs). */
+@keyframes uep-blink {
+  0% { opacity: 1; }
+  50% { opacity: 0; }
+  100% { opacity: 1; }
+}

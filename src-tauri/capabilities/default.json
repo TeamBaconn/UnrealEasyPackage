@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capabilities shared by the main window and the on-demand auxiliary windows (Build Settings, Build Logs, Plugin Log).",
+  "windows": ["main", "build-settings", "build-logs", "plugin-logs"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    { "identifier": "opener:allow-open-path", "allow": [{ "path": "**" }] },
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "dialog:default",
+    "notification:default"
+  ]
+}

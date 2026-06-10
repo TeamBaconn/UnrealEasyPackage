@@ -1,0 +1,55 @@
+[package]
+name = "unrealeasypackage"
+version = "0.1.0"
+description = "Saveable, reusable build profiles for Unreal Engine projects."
+authors = ["TeamBaconn"]
+license = "MIT"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "unrealeasypackage_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+# M6 — OS toast notifications on build finish (respects the saved notify pref).
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Derived, disposable build-history index (M4): fast paged/filtered queries + a
+# count-vs-folders drift check. `bundled` compiles SQLite from source (no system dep).
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-ini = "0.21.3"
+regex = "1.12.3"
+walkdir = "2.5.0"
+chrono = "0.4"
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-typescript = "=0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+tauri-plugin-dialog = "2.7.1"
+# Runner (M3): child-process spawn + async log streaming. Version already in the
+# lock via Tauri; we only add direct features (process/io/sync/time + select!).
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
+# Job Objects — group a build's child-process tree so Cancel / app-exit terminate
+# all of it (RunUAT → UBT → cl.exe), not just the immediate cmd.exe (runner::exec).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+
+[target."cfg(not(windows))".dependencies]
+dirs = "6.0.0"
+
