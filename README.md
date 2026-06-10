@@ -31,6 +31,16 @@
 
 ➡️ **[Screen-by-screen tour → docs/features.md](docs/features.md)**
 
+## Download
+
+Prebuilt binaries are attached to every [**release**](https://github.com/TeamBaconn/UnrealEasyPackage/releases). Open the latest release, expand **Assets**, and grab the one for your platform - no build tools needed:
+
+- **Windows:** the `.exe` (NSIS) or `.msi` installer, or the no-install **`-windows-portable.zip`** (unzip and run - needs the WebView2 runtime, preinstalled on Windows 10/11).
+- **macOS:** the `.dmg`.
+- **Linux:** the `.AppImage` (portable) or `.deb`.
+
+> Installers are unsigned, so Windows SmartScreen / macOS Gatekeeper may warn on first launch - choose *Run anyway* / *Open*.
+
 ## Build from source
 
 **Prerequisites**
