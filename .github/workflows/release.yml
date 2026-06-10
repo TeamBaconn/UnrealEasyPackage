@@ -64,3 +64,15 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Build portable zip (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: Compress-Archive -Path src-tauri/target/release/unrealeasypackage.exe -DestinationPath "UnrealEasyPackage-${{ github.ref_name }}-windows-portable.zip"
+
+      - name: Upload portable zip to release
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} UnrealEasyPackage-${{ github.ref_name }}-windows-portable.zip --clobber
