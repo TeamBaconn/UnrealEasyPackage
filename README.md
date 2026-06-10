@@ -7,10 +7,9 @@
 
 > UnrealEasyPackage is a lightweight tool for solo developers and small teams who find Unreal's packaging process vague and cumbersome. At this scale, hosting a dedicated CI/CD pipeline is overkill so instead, anyone on the team can run a build on their own using shared build settings, along with other tools that streamline day-to-day development.
 
-<p align="center">
-  <img src="screenshots/build-history.jpg" height="305" alt="Build history and profiles">
-  <img src="screenshots/build-logs.jpg" height="305" alt="Live build pipeline and logs">
-</p>
+![Build history and profiles](screenshots/build-history.jpg)
+
+![Live build pipeline and logs](screenshots/build-logs.jpg)
 
 ## Why
 
