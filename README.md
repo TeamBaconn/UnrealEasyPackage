@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri)](https://tauri.app/)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg?logo=windows)](#)
+[![GitHub all releases](https://img.shields.io/github/downloads/TeamBaconn/UnrealEasyPackage/total)](https://github.com/TeamBaconn/UnrealEasyPackage/releases)
 
 > UnrealEasyPackage is a lightweight tool for solo developers and small teams who find Unreal's packaging process vague and cumbersome. At this scale, hosting a dedicated CI/CD pipeline is overkill so instead, anyone on the team can run a build on their own using shared build settings, along with other tools that streamline day-to-day development.
 
