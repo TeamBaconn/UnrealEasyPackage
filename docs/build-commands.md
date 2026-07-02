@@ -408,3 +408,45 @@ Cross-checked against (authority order):
 - **No official exhaustive flag list exists** - see the Epic forum thread [RunUAT BuildCookRun full command line options documentation?](https://forums.unrealengine.com/t/runuat-buildcookrun-full-command-line-options-documentation/128809). Hence the `-help` rule.
 
 **Flagged uncertainties (verify against `-help` for the target engine):** exact phase defaults; whether `-iostore`/Zen are on (read `ProjectPackagingSettings`); `-cookflavor` as a literal switch name (flavor is often encoded in the platform name); `-distribution` necessity for plain Steam Win64; several advanced DLC/patch/IoStore sub-flags.
+
+---
+
+## 11. Steam upload - `steamcmd +run_app_build`
+
+An optional **post-archive pipeline phase** (`SteamUpload`, registry order 65, after Copy Extras, gated by Archive) that publishes the finished build to Steam. The Archive gate is **enforced at build time**, not just greyed in the editor: the arg builder emits neither the upload nor its sign-in preflight unless Stage + Archive are on, and `validate_profile` rejects a profile that enables Steam upload with Archive off - so the upload can never run against an output dir that was never archived (which would push a stale build). Steam distribution runs on **SteamPipe**, and the only supported programmatic upload is `steamcmd` driving **VDF build scripts** - there is no Unreal-native path. So this phase shells `steamcmd` against generated VDFs; it reuses the same `runner/` substrate (spawn + live stream + Job-Object tree-kill + per-phase timing + history) as every other external phase.
+
+### The command
+
+```
+steamcmd.exe +login <account> +run_app_build <app_build.vdf> +quit
+```
+
+- **Standalone steamcmd is enough** - `+run_app_build` is a built-in steamcmd command; the SDK's `tools/ContentBuilder` layout is only a convention its *default* (relative-path) VDFs assume. Our VDFs use absolute paths, so the full Steamworks SDK isn't required (the user points at a `steamcmd.exe`).
+- **Auth: no in-app login; a Steam Login preflight phase.** Steam won't let partner accounts disable Steam Guard, and there's no website/QR OAuth for steamcmd uploads. The config holds only the **steamcmd path + account name** - never a password. When the upload phase is enabled, the arg builder emits an implicit **`SteamLogin` preflight before Build** (`PhaseId::SteamLogin`, not a registry/editor phase - scheduled as the first stage in `plan.rs`). At that step the runner runs a **cancellable** session check (`steam::login::build_verify_command` → `+login <account> +quit`, no password; the child is adopted into the Job Object so Cancel / app-exit tear it down, since steamcmd's first run self-updates and can take minutes): if a session is cached it's a no-op; if not, it opens steamcmd in its **own console** (`CREATE_NEW_CONSOLE`, `runner::exec::run_in_console`) so the user signs in **there** - Steam Guard code, or **mobile-app confirmation** (approve on the phone). steamcmd then `+quit`s and the runner **re-checks the session before letting the build proceed** - steamcmd exits 0 even on an aborted/failed login, so its exit code is never trusted; the classifier (`steam::login::classify_output`) is **fail-safe**, treating a bare exit-0-with-no-signed-in-marker as *not signed in*, so an incomplete sign-in fails the phase up front rather than after a finished build. Front-loading it means the interactive sign-in never interrupts a *finished* build. The actual **upload phase is piped-only** (streamed to the Build Logs) and never opens a console: if somehow not signed in by then it just fails. No password ever enters the app.
+- **Machine-local paths can be project-relative.** The steamcmd path stored in `local.json` may be relative (`./Tools/steamcmd/steamcmd.exe`) when it lives inside the project - portable if the project moves; `commands::resolve_local_path` resolves it against the project root before spawning (absolute paths pass through). It shares the arg builder's `unreal::args::resolve_under_root` helper, so a machine-local path and the output base dir can never anchor by different rules.
+
+### The VDFs (managed + custom-key-preserving)
+
+Two files per profile: an **app build** VDF and one **depot build** VDF per depot.
+
+```
+"AppBuild" {                          "DepotBuild" {
+  "AppID"       "480"                   "DepotID" "481"
+  "Desc"        "<build desc>"          "FileMapping" {
+  "Preview"     "1"   // dry-run          "LocalPath" "*"  "DepotPath" "." "Recursive" "1"
+  "SetLive"     "beta"                   }
+  "ContentRoot" "<archive dir>"        }
+  "BuildOutput" "<scratch>"
+  "Depots" { "481" "depot_481.vdf" }
+}
+```
+
+- **Managed fields** (`AppID`/`Desc`/`Preview`/`SetLive` + the depot list + each depot's `DepotID`) live in the profile's `SteamUploadCfg` and are edited in the Build Settings editor. On save they're merged into the **committed** VDFs at `<project>/.uep/steam-config/<profile-id>/*.vdf`, **preserving any unknown keys the user added by hand** (custom `FileMapping`/`FileExclusion`/etc.). The committed VDFs carry no machine paths, so they're shareable (git-committed like `profiles/`).
+- **`ContentRoot`/`BuildOutput` are injected at run**, never committed: a runner pre-step (`steam::vdf::resolve_run_vdf`, mirroring Stage's archive-dir clean) reads the committed VDFs, injects `ContentRoot` = the resolved `-archivedirectory` and `BuildOutput` = a scratch subdir, and writes a resolved copy into the git-ignored `<project>/.uep/steam-build-output/<profile-id>/` that steamcmd runs against. That scratch dir (steamcmd chunk cache + logs + resolved VDFs) is a cleanup category (`SteamBuildOutput`).
+- **`Preview` defaults off** (a normal build uploads for real); turn it on for a dry run (build the manifest + validate mappings, upload nothing). `SetLive` can target a beta branch but **never** the public `default` branch (Steam blocks that from scripts) - the editor field errors on `default` and `validate_profile` rejects it; publish the public branch manually in Steamworks.
+- **Editor layout:** the machine-local **steamcmd path + build account** live in a **Setup SteamCMD** modal (a big button atop the Steam phase), which also shows a live **status check** (`steam_status`: steamcmd found? + can sign in? via `verify`) with a **"Try sign in"** link (`steam_open_login_terminal`) that opens the steamcmd console for an out-of-build sign-in. The phase body itself holds only the shared/committed fields (App ID, description, branch, preview, depots).
+- **Patch-size tip:** align UnrealPak chunks to SteamPipe's 1 MB boundary via the Pak phase's additional args - `-patchpaddingalign=1048576 -blocksize=1048576` (IoStore: `-iostorepatchpaddingalign=1048576`). Optional; not aligning just means larger deltas.
+
+**Implementation:** `steam::vdf` (hand-rolled order-preserving KeyValues tree + `write_committed_vdf`/`resolve_run_vdf`, no new crate; the quoted-string tokenizer preserves unknown escapes so a hand-authored value with backslashes round-trips) · `steam::login` (`build_verify_command` + the fail-safe `classify_output`; `verify` wraps them for the Setup modal's status check) · `unreal::args` emits the `SteamLogin` preflight + the upload command only when Archive is on (env carries the resolved steamcmd path + account) · `runner::exec` runs the preflight as a cancellable, Job-Object-adopted session check → `run_in_console` when needed → re-check before proceeding, then the piped upload (VDF pre-step, no console) · `commands::steam_status` powers the Setup modal's status check · machine-local settings in `storage::SteamLocalSettings` (`.uep/steam-config/local.json`, git-ignored; steamcmd path may be project-relative).
+
+**Steam sources** - [Steamworks: Uploading to Steam (SteamPipe)](https://partner.steamgames.com/doc/sdk/uploading) (VDF formats, `run_app_build`, Preview/SetLive, build-account auth, config.vdf caching) · [SteamCMD (Valve wiki)](https://developer.valvesoftware.com/wiki/SteamCMD) · [GameCI: Deploy to Steam](https://game.ci/docs/github/deployment/steam/) (Steam Guard one-time login) · [Unrealution: aligning UnrealPak chunks with SteamPipe](https://unrealution.com/packaging/aligning-unreal-pak-chunks-with-steampipe-chunks-to-optimize-delta-updates/).

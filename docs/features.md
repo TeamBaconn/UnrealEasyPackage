@@ -14,13 +14,17 @@ The home of a project. Pick a saved profile from the dropdown and hit **Run**, o
 
 ![Build settings](../screenshots/build-settings.jpg)
 
-Profiles capture a whole package configuration: platform, target, and which **phases** run (Build, Cook, Stage, Pak, Archive, Copy Extras). Toggle phases on or off, add file mappings for extras like `steam_appid.txt`, and save. Create as many profiles as you have build flavors.
+Profiles capture a whole package configuration: platform, target, one or more build **configurations** (tick Development *and* Shipping and both are built and staged into a single package), and which **phases** run (Build, Cook, Stage, Pak, Archive, Copy Extras, Steam upload, Clean-up). Toggle phases on or off, add file mappings for extras like `steam_appid.txt`, and save. Create as many profiles as you have build flavors.
 
 ## Live pipeline + logs
 
 ![Build logs](../screenshots/build-logs.jpg)
 
 While a build runs, each phase shows up as a node in a **pipeline graph** (done / running / pending / failed) with per-phase timing. The streaming **console** below tints lines by severity, counts warnings and errors, and is searchable. The exact command that was launched is shown at the bottom. Cancel at any time.
+
+## Publish to Steam
+
+Turn on the **Steam upload** phase and the archived build ships straight to Steam via `steamcmd` - no separate ContentBuilder setup. Set your **App ID** and **depots** in the profile, then point the app at a `steamcmd.exe` and your Steam build account under **Setup SteamCMD**. There's no password field: the build opens steamcmd once so you sign in there (enter the Steam Guard code, or approve on your phone), and the cached session is reused after that - front-loaded before the build, so signing in never interrupts a finished package. Flip **Preview** on for a dry run that validates the upload without publishing. The phase requires Archive (there has to be a finished build to push), and the generated VDF scripts stay yours to hand-tune - any custom keys you add are preserved across saves.
 
 ## Dashboard
 

@@ -364,7 +364,9 @@ export function BuildTab() {
                 <Table.Td>
                   <Group gap={6}>
                     <Tag>{live.platform}</Tag>
-                    <Tag>{live.config}</Tag>
+                    {live.configs.map((c) => (
+                      <Tag key={c}>{c}</Tag>
+                    ))}
                     <Tag>{live.target}</Tag>
                   </Group>
                 </Table.Td>

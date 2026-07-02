@@ -92,6 +92,7 @@ pub fn simple_paths(cat: CleanupCategory) -> &'static [&'static str] {
         Cooked => &["Saved/Cooked"],
         Shader => &["Saved/Shaders", "Saved/ShaderDebugInfo"],
         DerivedData => &["DerivedDataCache"],
+        SteamBuildOutput => &[".uep/steam-build-output"],
         BinariesGame | BinariesPlugin | IntermediateGame | IntermediateOther | IntermediatePlugin => &[],
     }
 }
@@ -99,7 +100,7 @@ pub fn simple_paths(cat: CleanupCategory) -> &'static [&'static str] {
 /// All categories, in Clean-tab display order - the complete reclaim surface (used by
 /// full-clean and tests).
 #[allow(dead_code)]
-pub const ALL_CATEGORIES: [CleanupCategory; 9] = [
+pub const ALL_CATEGORIES: [CleanupCategory; 10] = [
     CleanupCategory::Staged,
     CleanupCategory::Cooked,
     CleanupCategory::Shader,
@@ -109,6 +110,7 @@ pub const ALL_CATEGORIES: [CleanupCategory; 9] = [
     CleanupCategory::IntermediateOther,
     CleanupCategory::IntermediatePlugin,
     CleanupCategory::DerivedData,
+    CleanupCategory::SteamBuildOutput,
 ];
 
 // ── guardrail (defense-in-depth; the resolver already only yields valid targets) ──────
@@ -139,6 +141,9 @@ fn is_under_cleanup_root(rel: &str) -> bool {
         "Saved/ShaderDebugInfo",
         "Saved/Shaders",
         "DerivedDataCache",
+        // Only this exact `.uep/` subpath is cleanable - history/, cache/, profiles/,
+        // steam-config/ (the rest of `.uep/`) stay off-limits.
+        ".uep/steam-build-output",
     ];
     ROOTS.iter().any(|r| is_within(r, rel)) || is_plugin_compile(rel)
 }
@@ -231,6 +236,7 @@ mod tests {
         // Shader = the editor's PC shader cache + shader debug info.
         assert_eq!(simple_paths(Shader), ["Saved/Shaders", "Saved/ShaderDebugInfo"]);
         assert_eq!(simple_paths(DerivedData), ["DerivedDataCache"]);
+        assert_eq!(simple_paths(SteamBuildOutput), [".uep/steam-build-output"]);
         // Compile categories resolve per-target/plugin in `scan`, not via fixed paths.
         for c in [BinariesGame, BinariesPlugin, IntermediateGame, IntermediatePlugin] {
             assert!(simple_paths(c).is_empty());
@@ -251,6 +257,8 @@ mod tests {
             "Saved/Shaders",
             "Saved/ShaderDebugInfo",
             "DerivedDataCache",
+            ".uep/steam-build-output",
+            ".uep/steam-build-output/dev/output",
         ] {
             assert!(is_cleanup_path(ok), "{ok} should be a cleanup path");
         }
@@ -267,6 +275,10 @@ mod tests {
             "Plugins/Group/Nested/Source",  // nested plugin source still protected
             "Plugins/Group/Nested/Content", // nested plugin content still protected
             "Saved/Logs", // misc cache, not a cleanup root
+            ".uep/history",              // build records - never touched
+            ".uep/cache",                // derived index - never touched
+            ".uep/profiles",             // committed profiles - never touched
+            ".uep/steam-config/dev/app_build.vdf", // committed Steam config - never touched
         ] {
             assert!(!is_cleanup_path(no), "{no} must NOT be a cleanup path");
         }

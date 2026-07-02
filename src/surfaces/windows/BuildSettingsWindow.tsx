@@ -7,6 +7,7 @@ import {
   Checkbox,
   type CheckboxProps,
   Collapse,
+  Divider,
   Group,
   Menu,
   Modal,
@@ -44,11 +45,17 @@ import {
   duplicateProfile,
   listProfiles,
   listTemplates,
+  loadSteamSettings,
   pickDirectory,
   pickFile,
   saveProfile,
+  saveSteamSettings,
   saveTemplate,
+  steamOpenLoginTerminal,
+  steamStatus,
   type BuildConfig,
+  type SteamLocalSettings,
+  type SteamStatus,
   type CleanupCategory,
   type Configuration,
   type CookMaps,
@@ -69,7 +76,7 @@ interface Draft {
   id: string;
   name: string;
   platform: Platform;
-  config: Configuration;
+  configs: Configuration[];
   target: string | null;
   phases: {
     build: { enabled: boolean; clean: boolean; noP4: boolean; additionalArgs: string };
@@ -92,6 +99,14 @@ interface Draft {
     pak: { enabled: boolean; ioStore: boolean; compressed: boolean; package: boolean; additionalArgs: string };
     archive: { enabled: boolean; additionalArgs: string };
     copyExtras: { enabled: boolean; items: { from: string; to: string }[] };
+    steamUpload: {
+      enabled: boolean;
+      appId: string;
+      description: string;
+      branch: string;
+      preview: boolean;
+      depots: { depotId: string; path: string }[];
+    };
     cleanup: { enabled: boolean; categories: CleanupCategory[]; onlyOnSuccess: boolean };
   };
   output: { baseDir: string; folderTemplate: string };
@@ -101,6 +116,9 @@ interface Draft {
 
 const DEFAULT_FOLDER = "{project}-{platform}-{config}-{date}";
 
+// All build configurations, for the config checkbox group.
+const ALL_CONFIGS: Configuration[] = ["Debug", "DebugGame", "Development", "Test", "Shipping"];
+
 const COMMON_CULTURES = ["en", "en-US", "de", "de-DE", "fr", "fr-FR", "es", "es-ES", "ja", "ko", "zh-Hans", "pt-BR"];
 
 function toDraft(p: BuildConfig): Draft {
@@ -109,7 +127,7 @@ function toDraft(p: BuildConfig): Draft {
     id: p.id,
     name: p.name,
     platform: p.platform ?? "Win64",
-    config: p.config ?? "Development",
+    configs: p.configs?.length ? p.configs : ["Development"],
     target: p.target ?? null,
     phases: {
       build: {
@@ -146,6 +164,14 @@ function toDraft(p: BuildConfig): Draft {
         enabled: p.phases?.copyExtras?.enabled ?? false,
         items: (p.phases?.copyExtras?.items ?? []).map((i) => ({ from: i.from, to: i.to ?? "." })),
       },
+      steamUpload: {
+        enabled: p.phases?.steamUpload?.enabled ?? false,
+        appId: p.phases?.steamUpload?.appId ?? "",
+        description: p.phases?.steamUpload?.description ?? "",
+        branch: p.phases?.steamUpload?.branch ?? "",
+        preview: p.phases?.steamUpload?.preview ?? true,
+        depots: (p.phases?.steamUpload?.depots ?? []).map((d) => ({ depotId: d.depotId, path: d.path ?? "." })),
+      },
       cleanup: {
         enabled: p.phases?.cleanup?.enabled ?? false,
         categories: p.phases?.cleanup?.categories ?? [],
@@ -167,17 +193,23 @@ function toDraft(p: BuildConfig): Draft {
 // enabled when its own `enabled` flag is on and it isn't locked. Phase config is
 // indexed by id (camelCase PhaseId == the `phases` field names), so adding a phase
 // needs no change here.
+// Registry-configurable phases: every PhaseId except the implicit `steamLogin` preflight
+// (which has no editor toggle / Draft cfg). isLocked/isEnabled/setPhaseEnabled only ever run
+// on registry phases, so indexing `d.phases` by this narrower type is safe.
+type ConfigPhaseId = Exclude<PhaseId, "steamLogin">;
+
 function isLocked(id: PhaseId, d: Draft, byId: Map<PhaseId, PhaseInfo>): boolean {
   return (byId.get(id)?.gatedBy ?? []).some((g) => !isEnabled(g, d, byId));
 }
 function isEnabled(id: PhaseId, d: Draft, byId: Map<PhaseId, PhaseInfo>): boolean {
-  return d.phases[id].enabled && !isLocked(id, d, byId);
+  return d.phases[id as ConfigPhaseId].enabled && !isLocked(id, d, byId);
 }
 
 const PLATFORM_FOLDER: Record<Platform, string> = { Win64: "Windows", Linux: "Linux", Mac: "Mac" };
 
 function subtitleOf(p: BuildConfig): string {
-  return `${p.platform ?? "Win64"} · ${p.config ?? "Development"} · ${p.target ?? "auto-target"}`;
+  const configs = p.configs?.length ? p.configs.join(", ") : "Development";
+  return `${p.platform ?? "Win64"} · ${configs} · ${p.target ?? "auto-target"}`;
 }
 
 function pad(n: number): string {
@@ -193,7 +225,12 @@ function renderPreview(d: Draft, project: DetectedProject | null): string {
   let folder = d.output.folderTemplate;
   folder = subst(folder, "{project}", project?.name ?? "project");
   folder = subst(folder, "{platform}", PLATFORM_FOLDER[d.platform]);
-  folder = subst(folder, "{config}", d.config);
+  // Join the configs in the backend's canonical order (schema.rs `staged_configs`:
+  // the `Configuration` enum's declaration order + dedup, NOT tick order and NOT
+  // lexicographic - Test precedes Shipping). ALL_CONFIGS is in that same declaration
+  // order, so filtering it yields the exact path the build lands in. Doesn't touch the
+  // stored `configs` ordering (the checkbox order stays as the user set it).
+  folder = subst(folder, "{config}", ALL_CONFIGS.filter((c) => d.configs.includes(c)).join("+"));
   folder = subst(folder, "{profile}", d.name || "profile");
   folder = subst(folder, "{target}", d.target ?? "target");
   folder = subst(folder, "{date}", date);
@@ -240,6 +277,9 @@ const PHASE_BLURB: Record<PhaseId, string> = {
   pak: "Bundles staged files into .pak / IoStore containers. Requires Stage.",
   archive: "Copies the finished build to the output destination. Requires Stage.",
   copyExtras: "Copies project files into the finished build. From is project-relative; To is build-output-relative (“.” = build root).",
+  steamUpload: "Uploads the archived build to Steam via steamcmd. Runs after Copy Extras; requires Archive. Set the App ID + depots and log in below.",
+  // Implicit preflight (not shown as a phase island); the blurb only satisfies the exhaustive map.
+  steamLogin: "Signs in to Steam before the build so an interactive login never interrupts a finished build.",
   cleanup: "Purges chosen footprint categories after a successful build to reclaim disk.",
 };
 
@@ -272,6 +312,7 @@ export function BuildSettingsWindow() {
       setProject(proj);
       const reg = await phaseRegistry().catch(() => []);
       setRegistry(reg);
+      setCollapsed(new Set(reg.map((p) => p.id))); // every phase island starts collapsed
       if (proj) {
         const [ps, ts] = await Promise.all([listProfiles().catch(() => []), listTemplates().catch(() => [])]);
         setProfiles(ps);
@@ -386,6 +427,18 @@ export function BuildSettingsWindow() {
         cook: { ...d.phases.cook, maps: "all" },
         // Keep relative Copy Extras (portable across projects); absolute sources dropped above.
         copyExtras: { enabled: d.phases.copyExtras.enabled && keptExtras.length > 0, items: keptExtras },
+        // Steam upload is project-specific: App ID, depots, description, and set-live branch
+        // all target one Steam app. Reset to a generic, disabled state so a template never
+        // carries one project's Steam config into another (which would push to the WRONG
+        // app/depot). Preview is a non-project-specific structural flag, so it's kept.
+        steamUpload: {
+          ...d.phases.steamUpload,
+          enabled: false,
+          appId: "",
+          description: "",
+          branch: "",
+          depots: [],
+        },
       },
     };
     try {
@@ -653,7 +706,7 @@ export function BuildSettingsWindow() {
 // Flip a phase's `enabled`. Indexed by id - `PhaseId` is camelCase and matches the
 // `phases` field names, so no per-phase branching.
 function setPhaseEnabled(d: Draft, id: PhaseId, on: boolean) {
-  d.phases[id].enabled = on;
+  d.phases[id as ConfigPhaseId].enabled = on;
 }
 
 // ── profile rail ──────────────────────────────────────────────────────────────
@@ -838,7 +891,8 @@ function Island({
         py={12}
         wrap="nowrap"
         className="uep-hoverable"
-        style={{ cursor: "pointer", borderRadius: 8 }}
+        // enabled phases tint the header light green so active steps read at a glance
+        style={{ cursor: "pointer", borderRadius: 8, background: enabled ? tokens.successBg : undefined }}
         onClick={onToggleOpen}
       >
         <Group gap={12} wrap="nowrap">
@@ -921,14 +975,48 @@ function PhaseBody({
     <Stack gap={12} pt={12}>
       {id === "build" && (
         <Stack gap={12}>
-          <Select
-            label="Build configuration"
-            value={draft.config}
-            onChange={(v) => v && update((d) => void (d.config = v as Configuration))}
-            data={["Debug", "DebugGame", "Development", "Test", "Shipping"]}
-            allowDeselect={false}
-            w={300}
-          />
+          <Box>
+            <Group gap={6} wrap="nowrap" mb={6}>
+              <Text fz={11} fw={600} c={tokens.textMuted} style={{ letterSpacing: 0.3 }}>
+                BUILD CONFIGURATIONS
+              </Text>
+              <Tooltip
+                multiline
+                w={330}
+                withArrow
+                position="bottom-start"
+                label="Every ticked configuration is built and staged into the one package: one cook, one .exe per config (e.g. Development alongside Shipping). Each becomes a build-history tag and the folder name joins them. At least one is required."
+              >
+                <ActionIcon variant="subtle" color="gray" size="xs" radius="xl" aria-label="About build configurations">
+                  <IconInfoCircle size={14} />
+                </ActionIcon>
+              </Tooltip>
+            </Group>
+            <Paper withBorder radius="sm" p="sm" style={{ background: tokens.surfaceAlt }}>
+              <SimpleGrid cols={2} spacing={6} verticalSpacing={6}>
+                {ALL_CONFIGS.map((c) => (
+                  <Checkbox
+                    key={c}
+                    size="xs"
+                    label={c}
+                    checked={draft.configs.includes(c)}
+                    onChange={() =>
+                      update((d) => {
+                        const s = new Set(d.configs);
+                        s.has(c) ? s.delete(c) : s.add(c);
+                        d.configs = [...s];
+                      })
+                    }
+                  />
+                ))}
+              </SimpleGrid>
+            </Paper>
+            {draft.configs.length === 0 && (
+              <Text fz={11} c={tokens.danger} mt={6}>
+                Select at least one configuration - the profile can't be saved without one.
+              </Text>
+            )}
+          </Box>
           <Checkbox
             label="Clean build (-clean)"
             description="Wipe intermediates first. Mutually exclusive with incremental cook."
@@ -1017,6 +1105,8 @@ function PhaseBody({
       {id === "archive" && <ArchiveBody draft={draft} project={project} update={update} />}
 
       {id === "copyExtras" && <CopyExtrasBody draft={draft} project={project} update={update} />}
+
+      {id === "steamUpload" && <SteamBody draft={draft} project={project} update={update} />}
 
       {id === "cleanup" && <CleanupBody draft={draft} update={update} />}
     </Stack>
@@ -1362,6 +1452,314 @@ function CopyExtrasBody({
         Add mapping
       </Button>
     </Stack>
+  );
+}
+
+// ── Steam upload ──────────────────────────────────────────────────────────────
+// Managed fields (App ID / description / branch / preview / depots) live in the draft and
+// are written into the committed VDFs on save (preserving any custom keys). The steamcmd
+// path + build account are machine-local. There is no in-app login: when a build reaches
+// the upload step, steamcmd opens in its own window to sign in only when there's no active
+// session (see runner::exec), so no password is ever entered in the app.
+type SteamState = { steamcmdPath: string; account: string };
+
+function SteamBody({ draft, project, update }: { draft: Draft; project: DetectedProject; update: (fn: (d: Draft) => void) => void }) {
+  const s = draft.phases.steamUpload;
+  const [steam, setSteam] = useState<SteamState>({ steamcmdPath: "", account: "" });
+
+  useEffect(() => {
+    let alive = true;
+    loadSteamSettings()
+      .then((v) => alive && setSteam({ steamcmdPath: v.steamcmdPath ?? "", account: v.account ?? "" }))
+      .catch(() => {});
+    return () => void (alive = false);
+  }, []);
+
+  const [setupOpen, setSetupOpen] = useState(false);
+
+  const depots = s.depots;
+  return (
+    <Stack gap={12}>
+      <Button
+        fullWidth
+        leftSection={<IconAdjustments size={16} />}
+        onClick={() => setSetupOpen(true)}
+      >
+        Setup SteamCMD
+      </Button>
+      <Text fz={11} c={tokens.textDim}>
+        Build scripts are written to <code>.uep/steam-config/{draft.id}/</code> and shared with the project. Custom
+        VDF keys you add to those files are preserved on save.
+      </Text>
+      <Divider my={8} />
+      <Group grow gap={8} align="flex-start">
+        <TextInput
+          label="App ID"
+          placeholder="e.g. 480"
+          value={s.appId}
+          onChange={(e) => update((d) => void (d.phases.steamUpload.appId = e.currentTarget.value))}
+          styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+        />
+        <TextInput
+          label="Build description"
+          placeholder="shown only in your Steamworks builds page"
+          value={s.description}
+          onChange={(e) => update((d) => void (d.phases.steamUpload.description = e.currentTarget.value))}
+        />
+      </Group>
+
+      <TextInput
+        label={
+          <Group gap={6} wrap="nowrap">
+            <span>Set live on branch</span>
+            <Tooltip
+              multiline
+              w={300}
+              withArrow
+              label="Beta branch to publish to right after upload. Leave empty to upload only. Steam blocks the public 'default' branch from scripts, so publish it manually in Steamworks."
+            >
+              <IconInfoCircle size={14} color={tokens.textDim} />
+            </Tooltip>
+          </Group>
+        }
+        placeholder="(leave empty to upload only)"
+        value={s.branch}
+        onChange={(e) => update((d) => void (d.phases.steamUpload.branch = e.currentTarget.value))}
+        error={
+          s.branch.trim().toLowerCase() === "default"
+            ? 'The public "default" branch can\'t be set from a script; publish it manually in Steamworks.'
+            : undefined
+        }
+      />
+
+      <Checkbox
+        label="Preview"
+        description="Dry run: validates the upload without sending anything."
+        checked={s.preview}
+        onChange={(e) => update((d) => void (d.phases.steamUpload.preview = e.currentTarget.checked))}
+      />
+
+      <Divider my={8} />
+
+      <Box>
+        <Group gap={6} wrap="nowrap" mb={6}>
+          <Text fz={11} fw={600} c={tokens.textMuted} style={{ letterSpacing: 0.3 }}>
+            DEPOTS
+          </Text>
+          <Tooltip multiline w={280} withArrow label="Each depot uploads a slice of the archived build. Subpath is content-root-relative (“.” = the whole build). Refine file mappings/exclusions directly in the depot VDF.">
+            <IconInfoCircle size={14} color={tokens.textDim} />
+          </Tooltip>
+        </Group>
+        <Stack gap={8}>
+          {depots.length === 0 && (
+            <Text fz={12} c={tokens.textDim}>
+              No depots yet.
+            </Text>
+          )}
+          {depots.map((dep, i) => (
+            <Group key={i} gap={8} wrap="nowrap" align="center">
+              <TextInput
+                style={{ width: 130 }}
+                placeholder="depot id"
+                value={dep.depotId}
+                onChange={(e) => update((d) => void (d.phases.steamUpload.depots[i].depotId = e.currentTarget.value))}
+                styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+              />
+              <TextInput
+                style={{ flex: 1 }}
+                placeholder="content subpath (default .)"
+                value={dep.path}
+                onChange={(e) => update((d) => void (d.phases.steamUpload.depots[i].path = e.currentTarget.value))}
+                styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+              />
+              <Button
+                variant="subtle"
+                color="gray"
+                px={8}
+                onClick={() => update((d) => void d.phases.steamUpload.depots.splice(i, 1))}
+              >
+                <IconX size={15} />
+              </Button>
+            </Group>
+          ))}
+          <Button
+            variant="default"
+            size="compact-sm"
+            leftSection={<IconPlus size={14} />}
+            style={{ alignSelf: "flex-start" }}
+            onClick={() => update((d) => void d.phases.steamUpload.depots.push({ depotId: "", path: "." }))}
+          >
+            Add depot
+          </Button>
+        </Stack>
+      </Box>
+
+      <SteamSettingsModal
+        opened={setupOpen}
+        project={project}
+        value={steam}
+        onClose={() => setSetupOpen(false)}
+        onSaved={(next) => {
+          setSteam(next);
+          setSetupOpen(false);
+        }}
+      />
+    </Stack>
+  );
+}
+
+// steamcmd path + build account - machine-local (git-ignored `.uep/steam-config/local.json`),
+// opened from the "Setup SteamCMD" button. No password: sign-in happens in steamcmd's own
+// window at the build's Steam Login step. Shows a live setup + sign-in status (runs
+// `steamcmd +login <account> +quit`). The steamcmd path is stored project-relative when inside
+// the project.
+function SteamSettingsModal({
+  opened,
+  project,
+  value,
+  onClose,
+  onSaved,
+}: {
+  opened: boolean;
+  project: DetectedProject;
+  value: SteamState;
+  onClose: () => void;
+  onSaved: (s: SteamState) => void;
+}) {
+  const [s, setS] = useState<SteamState>(value);
+  const [status, setStatus] = useState<SteamStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  // Read the live setup + sign-in status. Reads the PERSISTED machine-local settings
+  // (steam_status loads them from disk) and never writes, so testing can't clobber the
+  // saved values - only the explicit Save button persists, so Cancel truly discards.
+  const check = async () => {
+    setChecking(true);
+    try {
+      setStatus(await steamStatus());
+    } catch (e) {
+      setStatus({ steamcmdFound: false, loggedIn: false, message: e instanceof IpcError ? e.message : String(e) });
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  // "Sign in": open steamcmd in its own console for interactive sign-in (Steam Guard code
+  // or phone approval). Detached - once signed in there, the status updates via Recheck.
+  // Does not persist the modal's settings (only Save does); it signs in against the saved
+  // steamcmd path/account.
+  const signIn = async () => {
+    try {
+      await steamOpenLoginTerminal();
+    } catch (e) {
+      setStatus({ steamcmdFound: false, loggedIn: false, message: e instanceof IpcError ? e.message : String(e) });
+    }
+  };
+
+  useEffect(() => {
+    if (opened) {
+      setS(value);
+      setStatus(null);
+      void check();
+    }
+  }, [opened]);
+
+  return (
+    <Modal opened={opened} onClose={onClose} title="Setup SteamCMD" centered>
+      <Stack gap={12}>
+        <Group align="flex-end" gap={8} wrap="nowrap">
+          <TextInput
+            label="steamcmd.exe path"
+            placeholder="C:\\steamcmd\\steamcmd.exe"
+            style={{ flex: 1 }}
+            value={s.steamcmdPath}
+            onChange={(e) => setS({ ...s, steamcmdPath: e.currentTarget.value })}
+            styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+          />
+          <Button
+            variant="default"
+            leftSection={<IconFolder size={15} />}
+            onClick={async () => {
+              const f = await pickFile("Locate steamcmd.exe", project.projectRoot);
+              // Store relative when it's inside the project (portable); absolute otherwise.
+              if (f) setS({ ...s, steamcmdPath: toProjectRelative(f, project.projectRoot) });
+            }}
+          >
+            Browse
+          </Button>
+        </Group>
+        <Group align="flex-end" gap={8} wrap="nowrap">
+          <TextInput
+            label="Steam build account"
+            placeholder="build account name"
+            style={{ flex: 1 }}
+            value={s.account}
+            onChange={(e) => setS({ ...s, account: e.currentTarget.value })}
+          />
+          <Button variant="default" disabled={!s.account.trim()} onClick={signIn}>
+            Sign in
+          </Button>
+        </Group>
+
+        <Paper withBorder radius="sm" p="sm" style={{ background: tokens.surfaceAlt }}>
+          <Group justify="space-between" align="center" mb={checking || status ? 8 : 0}>
+            <Text fz={11} fw={600} c={tokens.textMuted} style={{ letterSpacing: 0.3 }}>
+              STATUS
+            </Text>
+            <Button variant="default" size="compact-sm" loading={checking} onClick={() => void check()}>
+              Recheck
+            </Button>
+          </Group>
+          {checking && (
+            <Text fz={12} c={tokens.textDim}>
+              Checking steamcmd… (first run may update steamcmd)
+            </Text>
+          )}
+          {!checking &&
+            status &&
+            (status.loggedIn ? (
+              <Text fz={12} fw={600} c="teal">
+                ✓ Signed in as {s.account.trim()}
+              </Text>
+            ) : (
+              <Stack gap={4}>
+                <Text fz={12} fw={600} c={status.steamcmdFound ? "teal" : "red"}>
+                  {status.steamcmdFound ? "✓ steamcmd found" : "✗ steamcmd not found"}
+                </Text>
+                {status.steamcmdFound ? (
+                  <Text fz={12} fw={600} c="red">
+                    ✗ Not signed in
+                  </Text>
+                ) : (
+                  status.message && (
+                    <Text fz={11} c={tokens.textDim}>
+                      {status.message}
+                    </Text>
+                  )
+                )}
+              </Stack>
+            ))}
+        </Paper>
+
+        <Text fz={11} c={tokens.textDim}>
+          Machine-local, git-ignored. No password here: the build's Steam Login step opens steamcmd to sign in when
+          needed (enter the code or approve on your phone). Use a dedicated build account.
+        </Text>
+        <Group justify="flex-end" gap={8}>
+          <Button variant="default" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => {
+              void saveSteamSettings(s as SteamLocalSettings).catch(() => {});
+              onSaved(s);
+            }}
+          >
+            Save
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
   );
 }
 

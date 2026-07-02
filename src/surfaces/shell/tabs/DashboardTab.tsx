@@ -17,6 +17,10 @@ const STATUSES = ["Success", "Failed", "Cancelled"];
 const find = (tags: string[], vocab: string[]) => tags.find((t) => vocab.includes(t));
 const platformOf = (t: string[]) => find(t, PLATFORMS) ?? "-";
 const configOf = (t: string[]) => find(t, CONFIGS) ?? "-";
+// A multi-config build tags every staged config (tags.rs), so a build can carry
+// more than one config; `configsOf` returns them all (`configOf` keeps the first
+// for the default cohort selection).
+const configsOf = (t: string[]) => t.filter((x) => CONFIGS.includes(x));
 const statusOf = (t: string[]) => find(t, STATUSES) ?? "Success";
 const targetOf = (t: string[]) =>
   t.find((x) => !PLATFORMS.includes(x) && !CONFIGS.includes(x) && !STATUSES.includes(x)) ?? "-";
@@ -31,8 +35,13 @@ const cohortOf = (r: BuildRecord): Cohort => ({
   config: configOf(r.tags),
   target: targetOf(r.tags),
 });
-const sameCohort = (a: Cohort, b: Cohort) =>
-  a.platform === b.platform && a.config === b.config && a.target === b.target;
+// A build joins a cohort when platform + target match and ANY of its config tags is
+// the cohort's config - so a multi-config build (e.g. Development AND Shipping)
+// appears in every one of those config cohorts, not just its first.
+const matchesCohort = (r: BuildRecord, c: Cohort) =>
+  platformOf(r.tags) === c.platform &&
+  targetOf(r.tags) === c.target &&
+  configsOf(r.tags).includes(c.config);
 
 function fmtSecs(s: number): string {
   const x = Math.round(s);
@@ -124,7 +133,7 @@ export function DashboardTab() {
     const uniq = (vals: string[]) => [...new Set(vals)].filter((v) => v && v !== "-");
     return {
       platform: uniq(records.map((r) => platformOf(r.tags))),
-      config: uniq(records.map((r) => configOf(r.tags))),
+      config: uniq(records.flatMap((r) => configsOf(r.tags))),
       target: uniq(records.map((r) => targetOf(r.tags))),
     };
   }, [records]);
@@ -146,7 +155,7 @@ export function DashboardTab() {
   }, [records, options, defaultCohort]);
 
   const view = useMemo(() => {
-    const inCohort = cohort ? records.filter((r) => sameCohort(cohortOf(r), cohort)) : []; // newest-first
+    const inCohort = cohort ? records.filter((r) => matchesCohort(r, cohort)) : []; // newest-first
     const chrono = [...inCohort].reverse(); // oldest-first for the time series
 
     // Build size - archived builds only (a 0 = "never archived" would falsely dip).

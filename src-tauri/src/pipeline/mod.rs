@@ -27,7 +27,13 @@ pub enum PhaseId {
     Pak,
     Archive,
     CopyExtras,
+    SteamUpload,
     Cleanup,
+    /// Implicit Steam sign-in **preflight** - emitted before Build (only when the Steam upload
+    /// phase is enabled) so an interactive login happens up front, not after a finished build.
+    /// Not a registry phase / editor toggle (like the implicit editor build); it exists only
+    /// as an emitted execution unit + graph node.
+    SteamLogin,
 }
 
 /// Editor metadata. Every MVP phase is now toggleable, so the registry marks them
@@ -150,6 +156,17 @@ const REGISTRY: &[PhaseDef] = &[
         kind: PhaseKind::App,
     },
     PhaseDef {
+        id: PhaseId::SteamUpload,
+        label: "Upload to Steam",
+        order: 65,
+        // Uploads the archived tree, so it depends on and is gated by Archive (the
+        // editor greys it when Archive is off, like Pak/Archive gate on Stage).
+        depends_on: &[PhaseId::Archive],
+        gated_by: &[PhaseId::Archive],
+        requiredness: Requiredness::Optional,
+        kind: PhaseKind::External,
+    },
+    PhaseDef {
         id: PhaseId::Cleanup,
         label: "Clean-up",
         order: 70,
@@ -188,7 +205,7 @@ mod tests {
     #[test]
     fn registry_is_ordered_and_complete() {
         let r = registry();
-        assert_eq!(r.len(), 7);
+        assert_eq!(r.len(), 8);
         let orders: Vec<u32> = r.iter().map(|d| d.order).collect();
         let mut sorted = orders.clone();
         sorted.sort();
@@ -219,6 +236,8 @@ mod tests {
         let by = |id| registry().iter().find(|d| d.id == id).unwrap();
         assert_eq!(by(PhaseId::Pak).gated_by, &[PhaseId::Stage]);
         assert_eq!(by(PhaseId::Archive).gated_by, &[PhaseId::Stage]);
+        // Steam upload is gated too, but by Archive (it uploads the archived tree), not Stage.
+        assert_eq!(by(PhaseId::SteamUpload).gated_by, &[PhaseId::Archive]);
         for id in [PhaseId::Build, PhaseId::Cook, PhaseId::Stage, PhaseId::CopyExtras, PhaseId::Cleanup] {
             assert!(by(id).gated_by.is_empty(), "{id:?} is not gated");
         }

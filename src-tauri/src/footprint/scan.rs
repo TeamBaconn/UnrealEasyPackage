@@ -142,6 +142,9 @@ pub struct Collected {
     /// One leaf covering **all** plugins' `Intermediate`.
     intermediate_plugin: Option<Leaf>,
     derived: Leaf,
+    /// The Steam upload scratch dir (`.uep/steam-build-output`) - steamcmd's chunk cache +
+    /// logs + resolved run VDFs. Rendered under Cache alongside the DDC.
+    steam_build_output: Leaf,
 }
 
 impl Collected {
@@ -155,6 +158,7 @@ impl Collected {
         leaves.extend(self.intermediate_other);
         leaves.extend(self.intermediate_plugin);
         leaves.push(self.derived);
+        leaves.push(self.steam_build_output);
         leaves
     }
 }
@@ -176,6 +180,7 @@ pub fn collect(root: &Path, scope: &TargetScope) -> Collected {
         intermediate_other: intermediate_other_leaf(root, game_total),
         intermediate_plugin: plugin_agg_leaf(root, "Intermediate", CleanupCategory::IntermediatePlugin, "intermediatePlugin"),
         derived: simple_leaf(root, CleanupCategory::DerivedData, "Derived data cache"),
+        steam_build_output: simple_leaf(root, CleanupCategory::SteamBuildOutput, "Steam build output"),
     }
 }
 
@@ -209,7 +214,7 @@ pub fn scan(root: &Path, scope: &TargetScope) -> FootprintReport {
     }
     let intermediate = group("Intermediate", int_children);
 
-    let cache = group("Cache", vec![c.derived.node()]);
+    let cache = group("Cache", vec![c.derived.node(), c.steam_build_output.node()]);
 
     // Whole-tree total = sum of the four group totals (each already sums its leaves),
     // so there's no second pass over every leaf.
@@ -435,6 +440,7 @@ mod tests {
             .chain(&c.intermediate_other)
             .chain(&c.intermediate_plugin)
             .chain(std::iter::once(&c.derived))
+            .chain(std::iter::once(&c.steam_build_output))
             .find(|l| l.id == id)
             .unwrap_or_else(|| panic!("no leaf {id}"))
     }
@@ -515,6 +521,36 @@ mod tests {
         let l = leaf(&c, "intermediateGame:SampleProjectSteam");
         assert_eq!(l.size(), 5000 + 70); // arch-nested + legacy, editor/tool excluded
         assert_eq!(l.targets.len(), 2);
+    }
+
+    #[test]
+    fn steam_build_output_is_scanned_under_cache() {
+        let d = tempdir().unwrap();
+        let root = d.path();
+        put(root, ".uep/steam-build-output/dev/output/chunk.csm", 500);
+        put(root, "DerivedDataCache/x.ddc", 70);
+        // Other .uep/ data must never be sized by the scanner.
+        put(root, ".uep/history/rec/build.json", 9999);
+        put(root, ".uep/steam-config/dev/app_build.vdf", 9999);
+
+        let c = collect(root, &scope());
+        assert_eq!(leaf(&c, "steamBuildOutput").size(), 500);
+
+        let r = scan(root, &scope());
+        let cache = r.groups.iter().find(|g| g.label == "Cache").unwrap();
+        assert!(cache.children.iter().any(|n| n.id == "steamBuildOutput"));
+        // No committed/derived .uep/ data leaked into any location.
+        fn walk<'a>(n: &'a FootprintNode, out: &mut Vec<&'a str>) {
+            out.extend(n.locations.iter().map(|l| l.rel.as_str()));
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        let mut rels = Vec::new();
+        for g in &r.groups {
+            walk(g, &mut rels);
+        }
+        assert!(!rels.iter().any(|r| r.contains("history") || r.contains("steam-config")));
     }
 
     #[test]

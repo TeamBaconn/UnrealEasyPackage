@@ -17,7 +17,7 @@ use super::store;
 /// builds); *Shipping* drops them (`-nodebuginfo`, a footprint win). All are
 /// project-agnostic (empty target + output base dir) and `builtin: true`.
 pub fn builtins() -> Vec<BuildConfig> {
-    // Development is the schema default (config defaults to Development) plus the
+    // Development is the schema default (configs defaults to [Development]) plus the
     // one real deviation: keep debug symbols, since you debug dev builds.
     let development = BuildConfig {
         id: "builtin-development".into(),
@@ -30,13 +30,13 @@ pub fn builtins() -> Vec<BuildConfig> {
         ..Default::default()
     };
 
-    // Shipping differs from the default only in `config`; dropping debug symbols
+    // Shipping differs from the default only in `configs`; dropping debug symbols
     // (`-nodebuginfo`) is already the default, so nothing else to set.
     let shipping = BuildConfig {
         id: "builtin-shipping".into(),
         name: "Shipping".into(),
         builtin: true,
-        config: Configuration::Shipping,
+        configs: vec![Configuration::Shipping],
         ..Default::default()
     };
 
@@ -75,7 +75,7 @@ mod tests {
         assert!(b.iter().all(|t| t.target.is_none() && t.output.base_dir.is_empty()));
 
         let ship = b.iter().find(|t| t.name == "Shipping").unwrap();
-        assert_eq!(ship.config, Configuration::Shipping);
+        assert_eq!(ship.configs, vec![Configuration::Shipping]);
         assert!(!ship.phases.stage.debug_symbols, "shipping drops symbols");
 
         assert!(is_builtin("builtin-development"));

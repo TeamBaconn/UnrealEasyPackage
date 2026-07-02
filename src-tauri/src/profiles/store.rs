@@ -25,7 +25,31 @@ fn parse(text: &str) -> Option<BuildConfig> {
     if let Some(cats) = v.pointer_mut("/phases/cleanup/categories").and_then(|c| c.as_array_mut()) {
         cats.retain(|t| t.as_str().is_some_and(|s| CleanupCategory::from_token(s).is_some()));
     }
+    migrate_configs(&mut v);
     serde_json::from_value(v).ok()
+}
+
+/// Fold a pre-unification profile's single `config` (+ `extraConfigs`) into the unified
+/// `configs` array. Runs only when `configs` is absent/empty, so already-migrated (and
+/// new) profiles are untouched; on next save the legacy keys drop out. Order-preserving
+/// dedup - `staged_configs()` re-canonicalizes anyway.
+fn migrate_configs(v: &mut serde_json::Value) {
+    let has_configs = v.get("configs").and_then(|c| c.as_array()).is_some_and(|a| !a.is_empty());
+    if has_configs {
+        return;
+    }
+    let mut configs: Vec<String> = Vec::new();
+    if let Some(c) = v.get("config").and_then(|c| c.as_str()) {
+        configs.push(c.to_string());
+    }
+    if let Some(extras) = v.get("extraConfigs").and_then(|e| e.as_array()) {
+        configs.extend(extras.iter().filter_map(|e| e.as_str().map(str::to_string)));
+    }
+    let mut seen = std::collections::HashSet::new();
+    configs.retain(|c| seen.insert(c.clone()));
+    if !configs.is_empty() {
+        v["configs"] = serde_json::json!(configs);
+    }
 }
 
 /// Every `BuildConfig` in `dir`, sorted by name. Unparseable/foreign files are
@@ -124,7 +148,7 @@ mod tests {
         let mut c = BuildConfig::default();
         c.id = id.into();
         c.name = name.into();
-        c.config = Configuration::Shipping;
+        c.configs = vec![Configuration::Shipping];
         c.target = Some("SampleProjectSteam".into());
         c.output.base_dir = "C:/Builds".into();
         c
@@ -162,13 +186,13 @@ mod tests {
         let mut tmpl = BuildConfig::default();
         tmpl.id = "builtin-development".into();
         tmpl.name = "Default".into();
-        tmpl.config = Configuration::Shipping;
+        tmpl.configs = vec![Configuration::Shipping];
         tmpl.builtin = true; // cloning a fixed built-in...
 
         let p = from_template("p1".into(), "My Ship".into(), &tmpl);
         assert_eq!(p.id, "p1");
         assert_eq!(p.name, "My Ship");
-        assert_eq!(p.config, Configuration::Shipping); // copied
+        assert_eq!(p.configs, vec![Configuration::Shipping]); // copied
         assert_eq!(p.based_on_template.as_deref(), Some("builtin-development"));
         assert!(!p.builtin, "...must yield an editable, non-built-in copy");
     }
@@ -193,7 +217,32 @@ mod tests {
         let dup = duplicate("dup".into(), &src);
         assert_eq!(dup.id, "dup");
         assert_eq!(dup.name, "Nightly (copy)");
-        assert_eq!(dup.config, src.config);
+        assert_eq!(dup.configs, src.configs);
         assert_eq!(dup.based_on_template, None);
+    }
+
+    #[test]
+    fn legacy_config_and_extra_configs_migrate_to_configs() {
+        let d = tempdir().unwrap();
+        // A profile written before unification: single `config` + `extraConfigs`.
+        let legacy = r#"{ "schemaVersion": 1, "id": "old", "name": "Old",
+            "config": "DebugGame", "extraConfigs": ["Shipping", "DebugGame"],
+            "output": { "baseDir": "C:/Out" } }"#;
+        std::fs::write(d.path().join("old.json"), legacy).unwrap();
+
+        let p = load_one(d.path(), "old").unwrap();
+        assert_eq!(
+            p.staged_configs(),
+            vec![Configuration::DebugGame, Configuration::Shipping]
+        );
+    }
+
+    #[test]
+    fn oldest_profile_without_any_config_defaults_to_development() {
+        let d = tempdir().unwrap();
+        let legacy = r#"{ "schemaVersion": 1, "id": "old", "name": "Old", "output": { "baseDir": "C:/Out" } }"#;
+        std::fs::write(d.path().join("old.json"), legacy).unwrap();
+        let p = load_one(d.path(), "old").unwrap();
+        assert_eq!(p.configs, vec![Configuration::Development]);
     }
 }

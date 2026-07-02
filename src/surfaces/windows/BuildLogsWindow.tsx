@@ -82,7 +82,7 @@ const STAT = ["Success", "Failed", "Cancelled"];
 function reverseTags(tags: string[]) {
   return {
     platform: tags.find((t) => PLAT.includes(t)),
-    config: tags.find((t) => CONF.includes(t)),
+    configs: tags.filter((t) => CONF.includes(t)),
     status: tags.find((t) => STAT.includes(t)),
     target: tags.find((t) => !PLAT.includes(t) && !CONF.includes(t) && !STAT.includes(t)),
   };
@@ -105,6 +105,12 @@ function statusFromString(s: string): PhaseStatus {
   }
 }
 function phaseIdFromLabel(l: string): PhaseId {
+  // Steam Login is the preflight, Upload to Steam the post-archive tail - match them
+  // before Build so neither falls through to the "build" catch-all.
+  if (/steam login/i.test(l)) return "steamLogin";
+  if (/upload to steam/i.test(l)) return "steamUpload";
+  // Match Build first: multi-config emits "Build (DebugGame)", "Build (Shipping)", etc.
+  if (/^build/i.test(l)) return "build";
   if (/cook/i.test(l)) return "cook";
   if (/stage|pak|archive/i.test(l)) return "stage";
   if (/copy/i.test(l)) return "copyExtras";
@@ -113,11 +119,16 @@ function phaseIdFromLabel(l: string): PhaseId {
 }
 // Reconstruct the graph column from the phase label (the live plan's levels).
 function levelFromLabel(l: string): number {
+  // Steam Login preflight is the very first column (before the editor build).
+  if (/steam login/i.test(l)) return -1;
   if (/editor/i.test(l)) return 0;
-  if (l === "Build" || /cook/i.test(l)) return 1;
+  // All game builds ("Build", "Build (DebugGame)", …) share the build∥cook column.
+  if (/cook/i.test(l) || (/^build/i.test(l) && !/editor/i.test(l))) return 1;
   if (/stage|pak|archive/i.test(l)) return 2;
   if (/copy/i.test(l)) return 3;
-  if (/clean/i.test(l)) return 4;
+  // Upload to Steam is the tail stage after Copy Extras, before Clean-up.
+  if (/upload to steam/i.test(l)) return 4;
+  if (/clean/i.test(l)) return 5;
   return 1;
 }
 function timingToNode(t: PhaseTiming, index: number): PhaseNode {
@@ -142,7 +153,7 @@ function recordToSnap(detail: HistoryDetail): RunSnapshot {
     runId: r.buildId,
     project: "",
     platform: rev.platform ?? "",
-    config: rev.config ?? "",
+    configs: rev.configs,
     target: rev.target ?? "",
     outputDir: r.outputPath,
     startedMs: r.startedAtMs,
@@ -343,7 +354,7 @@ export function BuildLogsWindow() {
                 : missing
                 ? "This build is no longer in history"
                 : snap
-                ? [snap.project, snap.config, snap.platform, snap.target].filter(Boolean).join(" · ") +
+                ? [snap.project, snap.configs.join(", "), snap.platform, snap.target].filter(Boolean).join(" · ") +
                   ` · started ${fmtClock(snap.startedMs ?? Date.now())}`
                 : "No active build"}
             </Text>

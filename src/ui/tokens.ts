@@ -228,6 +228,7 @@ const cleanupCatsLight: Record<string, CleanupCatColor> = {
   intermediateOther: { color: "#5a5560", light: "#e6e4e8" },
   intermediatePlugin: { color: "#9bbf2c", light: "#eef3d0" },
   derivedData: { color: "#c4571f", light: "#f6e0d2" },
+  steamBuildOutput: { color: "#c65f8e", light: "#f7e0ea" },
 };
 const cleanupCatsDark: Record<string, CleanupCatColor> = {
   staged: { color: "#4f9eed", light: "#1c3147" },
@@ -239,6 +240,7 @@ const cleanupCatsDark: Record<string, CleanupCatColor> = {
   intermediateOther: { color: "#7a7280", light: "#2e2a33" },
   intermediatePlugin: { color: "#aacf3a", light: "#262e10" },
   derivedData: { color: "#d86a2f", light: "#341f12" },
+  steamBuildOutput: { color: "#d873a0", light: "#3a1f2c" },
 };
 export const cleanupCats: Record<string, CleanupCatColor> = { ...cleanupCatsLight };
 

@@ -45,7 +45,11 @@ impl Platform {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, specta::Type)]
+// `Ord` follows declaration order (Debug < DebugGame < Development < Test <
+// Shipping) - the canonical order `staged_configs()` sorts into, so the `{config}`
+// token, the `-clientconfig` list, and the history tags are deterministic regardless
+// of tick order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, specta::Type)]
 pub enum Configuration {
     Debug,
     DebugGame,
@@ -88,6 +92,9 @@ pub enum CleanupCategory {
     IntermediateOther,
     IntermediatePlugin,
     DerivedData,
+    /// The Steam upload scratch dir (`.uep/steam-build-output/`) - steamcmd's chunk
+    /// cache + logs + resolved run VDFs. Regenerable; safe to wipe.
+    SteamBuildOutput,
 }
 
 impl CleanupCategory {
@@ -102,6 +109,7 @@ impl CleanupCategory {
             CleanupCategory::IntermediateOther => "intermediateOther",
             CleanupCategory::IntermediatePlugin => "intermediatePlugin",
             CleanupCategory::DerivedData => "derivedData",
+            CleanupCategory::SteamBuildOutput => "steamBuildOutput",
         }
     }
 
@@ -120,6 +128,7 @@ impl CleanupCategory {
             "intermediateOther" => CleanupCategory::IntermediateOther,
             "intermediatePlugin" => CleanupCategory::IntermediatePlugin,
             "derivedData" => CleanupCategory::DerivedData,
+            "steamBuildOutput" => CleanupCategory::SteamBuildOutput,
             _ => return None,
         })
     }
@@ -347,6 +356,62 @@ impl Default for CleanupCfg {
     }
 }
 
+/// One Steam depot to upload. Mirrors the `CopyItem` shape so the editor reuses the
+/// Copy-Extras list editor. The `path` is the depot's content-root-relative source
+/// root (default `"."` = the whole archive tree), rendered into the depot VDF's
+/// `FileMapping` `LocalPath` when the depot template is first created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DepotItem {
+    /// Steam depot id (numeric string, e.g. `"481"`).
+    pub depot_id: String,
+    /// Content-root-relative source root (default `"."`).
+    #[serde(default = "dot")]
+    pub path: String,
+}
+
+/// Upload-to-Steam phase (`docs/build-commands.md` §11). Opt-in (default off) like the
+/// other post-archive app phases. These are the **managed** fields written into the
+/// committed `app_build.vdf` (`AppID`/`Desc`/`Preview`/`SetLive` + the depot list);
+/// unknown user-added VDF keys are preserved on regeneration. `ContentRoot`/`BuildOutput`
+/// are injected at run, never stored here; steamcmd path + build account are machine-local
+/// (`storage::SteamLocalSettings`), not in the committed profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamUploadCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Steam application id (numeric string).
+    #[serde(default)]
+    pub app_id: String,
+    /// Build description (visible only in your Steamworks builds page).
+    #[serde(default)]
+    pub description: String,
+    /// `SetLive` beta branch, or empty (upload only). Never the public `default` branch
+    /// (Steam blocks that from scripts).
+    #[serde(default)]
+    pub branch: String,
+    /// `"Preview" "1"` dry-run: validate + build the manifest without uploading. Default
+    /// **off** (a normal build uploads for real); turn it on for a dry run.
+    #[serde(default)]
+    pub preview: bool,
+    #[serde(default)]
+    pub depots: Vec<DepotItem>,
+}
+
+impl Default for SteamUploadCfg {
+    fn default() -> Self {
+        SteamUploadCfg {
+            enabled: false,
+            app_id: String::new(),
+            description: String::new(),
+            branch: String::new(),
+            preview: false,
+            depots: Vec::new(),
+        }
+    }
+}
+
 /// Per-phase config in pipeline order. Each phase owns its `enabled` toggle plus
 /// its parameters; Build/Cook/Stage/Pak/Archive each carry a verbatim
 /// `additional_args` escape hatch. Archive's output destination lives in `Output`
@@ -366,6 +431,9 @@ pub struct Phases {
     pub archive: ArchiveCfg,
     #[serde(default)]
     pub copy_extras: CopyExtrasCfg,
+    /// Upload the archived build to Steam (runs after Copy Extras). Off by default.
+    #[serde(default)]
+    pub steam_upload: SteamUploadCfg,
     #[serde(default)]
     pub cleanup: CleanupCfg,
 }
@@ -400,8 +468,13 @@ pub struct BuildConfig {
     pub name: String,
     #[serde(default)]
     pub platform: Platform,
-    #[serde(default)]
-    pub config: Configuration,
+    /// Client configs to build AND stage into the one package (e.g. Development +
+    /// Shipping): one cook, one exe per config. Non-empty (enforced by
+    /// `validate_profile`). Every config becomes its own history tag; the `{config}`
+    /// token joins them with `+`; the cook uses just the first (it is config-agnostic).
+    /// `staged_configs()` returns them deduped and in canonical order.
+    #[serde(default = "default_configs")]
+    pub configs: Vec<Configuration>,
     /// Project-specific (`None` in templates).
     #[serde(default)]
     pub target: Option<String>,
@@ -426,7 +499,7 @@ impl Default for BuildConfig {
             id: String::new(),
             name: String::new(),
             platform: Platform::default(),
-            config: Configuration::default(),
+            configs: default_configs(),
             target: None,
             phases: Phases::default(),
             output: Output::default(),
@@ -437,6 +510,29 @@ impl Default for BuildConfig {
 }
 
 impl BuildConfig {
+    /// The client configs to build and stage: deduped, in canonical order, and
+    /// guaranteed non-empty (falls back to Development if somehow empty). Drives the
+    /// Build-phase loop (one compile each), the Stage `-clientconfig=A+B` list, the
+    /// `{config}` token (joined with `+`), and the per-config history tags. The cook
+    /// uses only the first entry (cook output is config-agnostic).
+    pub fn staged_configs(&self) -> Vec<Configuration> {
+        let mut out = self.configs.clone();
+        out.sort();
+        out.dedup();
+        if out.is_empty() {
+            out.push(Configuration::Development);
+        }
+        out
+    }
+
+    /// The staged configs joined with `+` (e.g. `Development+Shipping`) - the single source
+    /// of order for the Stage `-clientconfig=A+B` list and the `{config}` output-folder token,
+    /// so the folder name can never drift from the client-config list. Built from
+    /// [`staged_configs`](Self::staged_configs) (already deduped and canonically ordered).
+    pub fn staged_config_join(&self) -> String {
+        self.staged_configs().iter().map(|c| c.as_str()).collect::<Vec<_>>().join("+")
+    }
+
     /// Lightweight validation for **saving a profile** (`docs/data-storage.md` -
     /// "authoritative validation runs in `profiles/`"). Returns every problem so
     /// the editor can show them at once. Templates skip the output check (a
@@ -448,6 +544,9 @@ impl BuildConfig {
         }
         if self.name.trim().is_empty() {
             errs.push("profile name is empty".into());
+        }
+        if self.configs.is_empty() {
+            errs.push("at least one build configuration must be selected".into());
         }
         if self.output.base_dir.trim().is_empty() {
             errs.push("output base directory is required".into());
@@ -464,6 +563,33 @@ impl BuildConfig {
         }
         if self.phases.cleanup.enabled && self.phases.cleanup.categories.is_empty() {
             errs.push("clean-up is enabled but no categories are selected".into());
+        }
+        if self.phases.steam_upload.enabled {
+            let steam = &self.phases.steam_upload;
+            // Steam upload pushes the archived build, so it requires Archive (registry
+            // gated_by = [Archive]); Archive itself only runs inside the Stage·Pak·Archive unit.
+            if !(self.phases.stage.enabled && self.phases.archive.enabled) {
+                errs.push(
+                    "Steam upload requires Archive - enable the Archive phase (it needs Stage), or turn Steam upload off".into(),
+                );
+            }
+            if steam.app_id.trim().is_empty() {
+                errs.push("Steam upload is enabled but the App ID is empty".into());
+            }
+            if steam.depots.is_empty() {
+                errs.push("Steam upload is enabled but no depots are configured".into());
+            }
+            for (i, d) in steam.depots.iter().enumerate() {
+                if d.depot_id.trim().is_empty() {
+                    errs.push(format!("Steam depot {} has an empty depot id", i + 1));
+                }
+            }
+            // The public `default` branch can't be pushed live from a script (Steam blocks it).
+            if steam.branch.trim().eq_ignore_ascii_case("default") {
+                errs.push(
+                    "Steam \"set live\" branch can't be \"default\" - Steam blocks the public branch from scripts; use a beta branch or leave it empty".into(),
+                );
+            }
         }
         if errs.is_empty() {
             Ok(())
@@ -483,6 +609,9 @@ fn dot() -> String {
 fn default_folder() -> String {
     "{project}-{platform}-{config}-{date}".into()
 }
+fn default_configs() -> Vec<Configuration> {
+    vec![Configuration::Development]
+}
 
 #[cfg(test)]
 mod tests {
@@ -493,11 +622,13 @@ mod tests {
         let p = BuildConfig::default();
         assert_eq!(p.schema_version, SCHEMA_VERSION);
         assert_eq!(p.platform, Platform::Win64);
-        assert_eq!(p.config, Configuration::Development);
+        assert_eq!(p.configs, vec![Configuration::Development]);
         // every build phase enabled by default; the two app phases off by default
         assert!(p.phases.build.enabled && p.phases.cook.enabled && p.phases.stage.enabled);
         assert!(p.phases.pak.enabled && p.phases.archive.enabled);
         assert!(!p.phases.copy_extras.enabled && !p.phases.cleanup.enabled);
+        // Steam upload is opt-in (off), and its dry-run Preview defaults off (real upload).
+        assert!(!p.phases.steam_upload.enabled && !p.phases.steam_upload.preview);
         // free-phase / per-phase defaults
         assert!(p.phases.build.no_p4 && !p.phases.build.clean);
         assert_eq!(p.phases.cook.incremental, IncrementalCookMode::None);
@@ -522,10 +653,12 @@ mod tests {
         p.target = Some("SampleProjectSteam".into());
         p.output.base_dir = "C:/Builds".into();
         p.phases.cook.maps = CookMaps::List(vec!["Entry".into(), "Arena".into()]);
+        p.configs = vec![Configuration::Development, Configuration::Shipping];
 
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"schemaVersion\""), "keys must be camelCase");
         assert!(json.contains("\"copyExtras\""));
+        assert!(json.contains("\"configs\""));
         let back: BuildConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
     }
@@ -539,6 +672,47 @@ mod tests {
         assert!(p.phases.pak.enabled);
         assert!(p.phases.cleanup.only_on_success);
         assert_eq!(p.output.folder_template, "{project}-{platform}-{config}-{date}");
+        // A minimal JSON with no `configs` key defaults to [Development].
+        assert_eq!(p.configs, vec![Configuration::Development]);
+    }
+
+    #[test]
+    fn staged_configs_are_canonical_ordered_and_deduped() {
+        let mut p = BuildConfig::default(); // configs = [Development]
+        assert_eq!(p.staged_configs(), vec![Configuration::Development]);
+
+        // Canonical (enum) order regardless of stored order: DebugGame < Shipping.
+        p.configs = vec![Configuration::Shipping, Configuration::DebugGame];
+        assert_eq!(
+            p.staged_configs(),
+            vec![Configuration::DebugGame, Configuration::Shipping]
+        );
+
+        // Duplicates collapse.
+        p.configs = vec![
+            Configuration::Development,
+            Configuration::Shipping,
+            Configuration::Shipping,
+        ];
+        assert_eq!(
+            p.staged_configs(),
+            vec![Configuration::Development, Configuration::Shipping]
+        );
+
+        // Empty falls back to Development (defensive; validate_profile rejects empty on save).
+        p.configs = vec![];
+        assert_eq!(p.staged_configs(), vec![Configuration::Development]);
+    }
+
+    #[test]
+    fn validate_profile_requires_at_least_one_config() {
+        let mut p = BuildConfig::default();
+        p.id = "p".into();
+        p.name = "P".into();
+        p.output.base_dir = "C:/Out".into();
+        p.configs = vec![];
+        let errs = p.validate_profile().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("configuration")));
     }
 
     #[test]
@@ -568,5 +742,40 @@ mod tests {
         let errs = p.validate_profile().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("categories")));
         assert!(errs.iter().any(|e| e.contains("empty source")));
+    }
+
+    #[test]
+    fn validate_profile_rejects_default_steam_branch() {
+        let mut p = BuildConfig::default();
+        p.id = "p".into();
+        p.name = "P".into();
+        p.output.base_dir = "C:/Out".into();
+        p.phases.steam_upload.enabled = true;
+        p.phases.steam_upload.app_id = "480".into();
+        p.phases.steam_upload.depots = vec![DepotItem { depot_id: "481".into(), path: ".".into() }];
+        p.phases.steam_upload.branch = "Default".into(); // case-insensitive
+        let errs = p.validate_profile().unwrap_err();
+        assert!(errs.iter().any(|e| e.to_lowercase().contains("default")));
+        // a beta branch (or empty) is fine
+        p.phases.steam_upload.branch = "beta".into();
+        assert!(p.validate_profile().is_ok());
+    }
+
+    #[test]
+    fn validate_profile_rejects_steam_upload_without_archive() {
+        let mut p = BuildConfig::default();
+        p.id = "p".into();
+        p.name = "P".into();
+        p.output.base_dir = "C:/Out".into();
+        p.phases.steam_upload.enabled = true;
+        p.phases.steam_upload.app_id = "480".into();
+        p.phases.steam_upload.depots = vec![DepotItem { depot_id: "481".into(), path: ".".into() }];
+        p.phases.steam_upload.branch = "beta".into();
+        // Archive on (default) - Steam upload is allowed.
+        assert!(p.validate_profile().is_ok());
+        // Turn Archive off: Steam upload now has nothing fresh to push, so it's rejected.
+        p.phases.archive.enabled = false;
+        let errs = p.validate_profile().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("Steam upload requires Archive")));
     }
 }

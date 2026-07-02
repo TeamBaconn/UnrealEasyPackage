@@ -5,7 +5,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { commands } from "./bindings";
-import type { AppError, AppSettings, BuildConfig, CreateRequest, HistoryFilter, PluginPackageRequest, ResaveOptions, ValidateOptions } from "./bindings";
+import type { AppError, AppSettings, BuildConfig, CreateRequest, HistoryFilter, PluginPackageRequest, ResaveOptions, SteamLocalSettings, ValidateOptions } from "./bindings";
 
 export type {
   AppError,
@@ -46,6 +46,11 @@ export type {
   CopyItem,
   CleanupCfg,
   CleanupCategory,
+  // Steam upload phase
+  SteamUploadCfg,
+  DepotItem,
+  SteamLocalSettings,
+  SteamStatus,
   Output,
   PhaseInfo,
   PhaseId,
@@ -128,6 +133,16 @@ export const startResave = (options: ResaveOptions) => unwrap(commands.startResa
 export const startValidate = (options: ValidateOptions) => unwrap(commands.startValidate(options));
 /** Delete UEP's per-project (.uep) or per-plugin (.uap) data, forget the recent, clear state. */
 export const removeUepData = () => unwrap(commands.removeUepData());
+
+// ── Steam upload phase: machine-local settings + one-time steamcmd login ──────
+/** The open project's machine-local Steam settings (steamcmd path + build account). */
+export const loadSteamSettings = () => unwrap(commands.loadSteamSettings());
+/** Persist the open project's machine-local Steam settings (git-ignored). */
+export const saveSteamSettings = (settings: SteamLocalSettings) => unwrap(commands.saveSteamSettings(settings));
+/** Setup status for the Setup SteamCMD modal: steamcmd found + can-sign-in (runs a check). */
+export const steamStatus = () => unwrap(commands.steamStatus());
+/** Open steamcmd in its own console for an interactive sign-in (the "Try sign in" link). */
+export const steamOpenLoginTerminal = () => unwrap(commands.steamOpenLoginTerminal());
 
 // ── M2: profiles, templates, phase registry ──────────────────────────────────
 // Profiles are project-local (read against the open project in backend state);

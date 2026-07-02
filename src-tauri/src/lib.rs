@@ -8,6 +8,7 @@ mod pipeline;
 mod profiles;
 mod runner;
 mod settings;
+mod steam;
 mod storage;
 mod unreal;
 
@@ -79,6 +80,11 @@ fn specta_builder() -> Builder<tauri::Wry> {
         // Editor commandlet tools (project Tools tab): Resave / Validate
         commands::start_resave,
         commands::start_validate,
+        // Steam upload phase: machine-local settings (steamcmd path + build account) + status
+        commands::load_steam_settings,
+        commands::save_steam_settings,
+        commands::steam_status,
+        commands::steam_open_login_terminal,
         // Remove UEP data from the open project (.uep) or plugin (.uap)
         commands::remove_uep_data,
     ])

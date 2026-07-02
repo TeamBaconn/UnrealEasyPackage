@@ -15,13 +15,14 @@
 
 - **Reusable, not fragile.** Save a tuned build profile instead of re-editing a wall of UAT flags every time.
 - **See the footprint.** A single Development build can scatter ~38 GB of regenerable artifacts. Scan it, understand it, reclaim it.
-- **Whole loop, one window.** Build, cook, stage, archive, inspect history, package plugins, and clean up - without leaving the app.
+- **Whole loop, one window.** Build, cook, stage, archive, publish to Steam, inspect history, package plugins, and clean up - without leaving the app.
 
 ## Features
 
-- **Build profiles** - save platform / target / configuration / phase toggles per profile, then pick and Run.
+- **Build profiles** - save platform / target / configurations / phase toggles per profile, then pick and Run. Build several client configs (e.g. Development + Shipping) into one package.
 - **Environment auto-detection** - resolves the engine from the project's association, lists targets and maps for you.
 - **Live pipeline + logs** - watch Build / Cook / Stage / Archive run as a phase graph beside a streaming, searchable console.
+- **Steam upload** - publish the archived build to Steam with `steamcmd` and generated VDF scripts. One-time sign-in (Steam Guard code or mobile approval) up front; no password ever stored.
 - **Dashboard** - build size, duration, success rate, and warning/error trends over time.
 - **Footprint cleanup** - a categorized scan of what's safe to delete; reclaim gigabytes in a click.
 - **Build history** - every build with size, duration, status, and tags; reopen any output folder.

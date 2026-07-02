@@ -44,6 +44,11 @@ pub struct BuildEnv<'a> {
     pub date: &'a str,
     /// `{time}` token, `HHMMSS` (resolved by the caller).
     pub time: &'a str,
+    /// Absolute path to the user's `steamcmd.exe` (machine-local; empty ⇒ the Steam upload
+    /// phase can't run). Only the Steam upload phase reads this.
+    pub steamcmd_path: &'a str,
+    /// Steam build account for the upload's `+login` (machine-local; empty ⇒ not logged in).
+    pub steam_account: &'a str,
 }
 
 /// One resolved execution unit. `phase` is its primary registry phase (the
@@ -91,36 +96,44 @@ pub fn render_folder_name(template: &str, ctx: &TokenContext) -> String {
         .to_lowercase()
 }
 
+/// Resolve a stored path against `root`: an **absolute** path is used verbatim; a
+/// **relative (local)** path has a leading `./` or `.\` stripped and is joined under
+/// `root` (a bare `.` or an empty relative resolves to `root` itself). Shared by the
+/// archive base-dir resolution here and the machine-local path resolver in `commands`,
+/// so the two can never diverge on how a project-relative path is anchored.
+pub fn resolve_under_root(root: &Path, stored: &str) -> std::path::PathBuf {
+    let s = stored.trim();
+    if Path::new(s).is_absolute() {
+        return Path::new(s).to_path_buf();
+    }
+    let rel = s.strip_prefix("./").or_else(|| s.strip_prefix(".\\")).unwrap_or(s);
+    if rel.is_empty() || rel == "." {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    }
+}
+
 /// The full resolved archive directory: `<base> / <rendered folder>`. A **relative
 /// (local)** base dir is resolved against the project root (the `.uproject`'s
 /// directory); an **absolute (direct)** base dir is used verbatim.
 pub fn resolved_output_dir(profile: &BuildConfig, env: &BuildEnv) -> String {
-    let folder = render_folder_name(&profile.output.folder_template, &token_context(profile, env));
-    let base_str = profile.output.base_dir.trim();
-    let abs_base = if Path::new(base_str).is_absolute() {
-        Path::new(base_str).to_path_buf()
-    } else {
-        // local/relative ⇒ under the project root; strip a leading `./` so the
-        // resolved path stays clean.
-        let root = Path::new(env.uproject_path).parent().unwrap_or_else(|| Path::new(""));
-        let rel = base_str
-            .strip_prefix("./")
-            .or_else(|| base_str.strip_prefix(".\\"))
-            .unwrap_or(base_str);
-        if rel.is_empty() || rel == "." {
-            root.to_path_buf()
-        } else {
-            root.join(rel)
-        }
-    };
+    // `{config}` joins every staged config (e.g. `development+shipping`), matching the
+    // history tags and the `-clientconfig=A+B` list (one source of order - see
+    // `BuildConfig::staged_config_join`).
+    let config_join = profile.staged_config_join();
+    let folder =
+        render_folder_name(&profile.output.folder_template, &token_context(profile, env, &config_join));
+    let root = Path::new(env.uproject_path).parent().unwrap_or_else(|| Path::new(""));
+    let abs_base = resolve_under_root(root, &profile.output.base_dir);
     abs_base.join(folder).display().to_string()
 }
 
-fn token_context<'a>(profile: &'a BuildConfig, env: &'a BuildEnv<'a>) -> TokenContext<'a> {
+fn token_context<'a>(profile: &'a BuildConfig, env: &'a BuildEnv<'a>, config: &'a str) -> TokenContext<'a> {
     TokenContext {
         project: env.project_name,
         platform: profile.platform.folder(),
-        config: profile.config.as_str(),
+        config,
         profile: &profile.name,
         target: env.target,
         date: env.date,
@@ -312,6 +325,27 @@ pub fn build_commands(profile: &BuildConfig, env: &BuildEnv) -> Vec<PhaseCommand
     let build_exe = batch(&env.engine.root, "Build");
     let project_arg = format!("-Project={}", env.uproject_path);
 
+    // Steam upload pushes the archived build, so it's gated on Archive (registry
+    // gated_by = [Archive]); Archive only runs inside the Stage·Pak·Archive unit, so Stage
+    // must be on too. Enforce that gate here so the upload (and its sign-in preflight) never
+    // run against an output dir that was never archived (which would push a stale build).
+    let steam_ready = profile.phases.steam_upload.enabled
+        && profile.phases.stage.enabled
+        && profile.phases.archive.enabled;
+
+    // ── Steam login preflight - emitted first (before Build) when the upload phase is on, so an
+    //    interactive sign-in (if needed) happens up front, not after a finished build. The
+    //    runner checks the cached session and only opens a console when necessary; these args
+    //    (`+login <account> +quit`) are the interactive-login command it runs in that case. ──
+    if steam_ready {
+        out.push(external(
+            PhaseId::SteamLogin,
+            "Steam Login",
+            env.steamcmd_path,
+            vec!["+login".to_string(), env.steam_account.to_string(), "+quit".to_string()],
+        ));
+    }
+
     // ── Build: editor first (C++ needs a built editor to cook with), then game.
     //    Skipped when the Build phase is off (downstream keeps -skipbuild and
     //    assumes current binaries). ──
@@ -333,18 +367,31 @@ pub fn build_commands(profile: &BuildConfig, env: &BuildEnv) -> Vec<PhaseCommand
             }
         }
 
-        let mut game = vec![
-            env.target.to_string(),
-            profile.platform.uat().to_string(),
-            profile.config.as_str().to_string(),
-            project_arg.clone(),
-            "-WaitMutex".to_string(),
-        ];
-        if profile.phases.build.clean {
-            game.push("-clean".to_string());
+        // One game build per config (primary + extras): each produces its own exe,
+        // all later staged against the single cook. `-clean` / additional args are
+        // shared, applied to each. Single-config keeps the bare "Build" label so the
+        // emitted plan is byte-identical to before multi-config existed.
+        let configs = profile.staged_configs();
+        let multi = configs.len() > 1;
+        for cfg in &configs {
+            let mut game = vec![
+                env.target.to_string(),
+                profile.platform.uat().to_string(),
+                cfg.as_str().to_string(),
+                project_arg.clone(),
+                "-WaitMutex".to_string(),
+            ];
+            if profile.phases.build.clean {
+                game.push("-clean".to_string());
+            }
+            game.extend(split_args(&profile.phases.build.additional_args));
+            let label = if multi {
+                format!("Build ({})", cfg.as_str())
+            } else {
+                "Build".to_string()
+            };
+            out.push(external(PhaseId::Build, &label, &build_exe, game));
         }
-        game.extend(split_args(&profile.phases.build.additional_args));
-        out.push(external(PhaseId::Build, "Build", &build_exe, game));
     }
 
     // ── Cook (BuildCookRun -skipbuild -cook). Skipped when Cook is off; downstream
@@ -355,7 +402,8 @@ pub fn build_commands(profile: &BuildConfig, env: &BuildEnv) -> Vec<PhaseCommand
             format!("-project={}", env.uproject_path),
             format!("-target={}", env.target),
             format!("-platform={}", profile.platform.uat()),
-            format!("-clientconfig={}", profile.config.as_str()),
+            // Cook is config-agnostic (one cook serves every staged config); pass the first.
+            format!("-clientconfig={}", profile.staged_configs()[0].as_str()),
             "-skipbuild".to_string(),
             "-cook".to_string(),
             // Cook-only: without this BuildCookRun falls through into Stage, which
@@ -404,7 +452,10 @@ pub fn build_commands(profile: &BuildConfig, env: &BuildEnv) -> Vec<PhaseCommand
             format!("-project={}", env.uproject_path),
             format!("-target={}", env.target),
             format!("-platform={}", profile.platform.uat()),
-            format!("-clientconfig={}", profile.config.as_str()),
+            // Stage every built config against the single cook - UAT copies one exe per
+            // config into the same package. Shares `staged_config_join` with the `{config}`
+            // output-folder token, so the folder name can never drift from this list.
+            format!("-clientconfig={}", profile.staged_config_join()),
             "-skipbuild".to_string(),
             "-skipcook".to_string(),
             "-stage".to_string(),
@@ -474,6 +525,27 @@ pub fn build_commands(profile: &BuildConfig, env: &BuildEnv) -> Vec<PhaseCommand
             preview.push_str(&format!("\n  {} → {}", item.from, dest));
         }
         out.push(app(PhaseId::CopyExtras, "Copy Extras", preview));
+    }
+
+    // ── Upload to Steam (steamcmd child) ────────────────────────────────────────
+    //   The VDF scripts are materialized into the scratch dir by the runner's pre-step
+    //   (`runner::exec`, like Stage's archive-dir clean); this just resolves the steamcmd
+    //   invocation. Runs after Copy Extras so any staged extras (e.g. steam_appid.txt) are
+    //   in the archived tree before it uploads.
+    if steam_ready {
+        let project_root = Path::new(env.uproject_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let vdf = crate::steam::run_app_build_vdf_path(&project_root, &profile.id);
+        let steam_args = vec![
+            "+login".to_string(),
+            env.steam_account.to_string(),
+            "+run_app_build".to_string(),
+            vdf.display().to_string(),
+            "+quit".to_string(),
+        ];
+        out.push(external(PhaseId::SteamUpload, "Upload to Steam", env.steamcmd_path, steam_args));
     }
 
     // ── Clean-up (app-owned, terminal) ──────────────────────────────────────────
@@ -615,6 +687,8 @@ mod tests {
             editor_target: Some("SampleProjectEditor"),
             date: "20260603",
             time: "143501",
+            steamcmd_path: "C:/steamcmd/steamcmd.exe",
+            steam_account: "builder_bot",
         }
     }
 
@@ -625,7 +699,7 @@ mod tests {
         p.id = "dev".into();
         p.name = "Development".into();
         p.platform = Platform::Win64;
-        p.config = Configuration::Development;
+        p.configs = vec![Configuration::Development];
         p.target = Some("SampleProjectSteam".into());
         p.output.base_dir = "C:/Builds".into();
         p
@@ -803,6 +877,61 @@ mod tests {
     }
 
     #[test]
+    fn multi_config_builds_each_and_stages_the_joined_list() {
+        let eng = engine(EngineKind::Source);
+        let mut p = dev_profile();
+        p.configs = vec![Configuration::DebugGame, Configuration::Shipping];
+        p.phases.build.clean = true;
+        p.phases.build.additional_args = "-extra".into();
+        let cmds = build_commands(&p, &env(&eng));
+
+        // One game build per config (canonical order), each per-config labeled, after editor.
+        let builds: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c.phase == PhaseId::Build)
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(builds, vec!["Build (Editor)", "Build (DebugGame)", "Build (Shipping)"]);
+
+        // Each game build carries its own config positional + the shared clean/extra args.
+        for (label, cfg) in [("Build (DebugGame)", "DebugGame"), ("Build (Shipping)", "Shipping")] {
+            let g = cmd(&cmds, label);
+            assert!(g.args.contains(&cfg.to_string()), "{label} missing {cfg}");
+            assert!(g.args.contains(&"-clean".to_string()), "{label} missing -clean");
+            assert!(g.args.contains(&"-extra".to_string()), "{label} missing additional arg");
+        }
+
+        // Stage joins the whole set; cook uses just the first; never -configuration.
+        assert!(cmd(&cmds, "Stage · Pak · Archive")
+            .args
+            .contains(&"-clientconfig=DebugGame+Shipping".to_string()));
+        assert!(cmd(&cmds, "Cook").args.contains(&"-clientconfig=DebugGame".to_string()));
+        assert!(!cmds.iter().flat_map(|c| &c.args).any(|a| a == "-configuration"));
+    }
+
+    #[test]
+    fn staged_config_dedup_in_args() {
+        // Out-of-order + duplicate configs collapse to a canonical, deduped set.
+        let eng = engine(EngineKind::Source);
+        let mut p = dev_profile();
+        p.configs = vec![
+            Configuration::Shipping,
+            Configuration::Development,
+            Configuration::Shipping,
+        ];
+        let cmds = build_commands(&p, &env(&eng));
+        let builds: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c.phase == PhaseId::Build && c.label != "Build (Editor)")
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(builds, vec!["Build (Development)", "Build (Shipping)"]);
+        assert!(cmd(&cmds, "Stage · Pak · Archive")
+            .args
+            .contains(&"-clientconfig=Development+Shipping".to_string()));
+    }
+
+    #[test]
     fn blueprint_project_skips_editor_build() {
         let eng = engine(EngineKind::Source);
         let mut e = env(&eng);
@@ -888,6 +1017,8 @@ mod tests {
             assert!(spa.args.iter().any(|a| a == f), "stage group missing {f}");
         }
         assert!(spa.args.iter().any(|a| a.starts_with("-archivedirectory=")));
+        // Single-config (no extras): the stage list is just the primary - unchanged.
+        assert!(spa.args.contains(&"-clientconfig=Development".to_string()));
     }
 
     #[test]
@@ -942,7 +1073,7 @@ mod tests {
     fn shipping_drops_debug_info() {
         let eng = engine(EngineKind::Source);
         let mut p = dev_profile();
-        p.config = Configuration::Shipping;
+        p.configs = vec![Configuration::Shipping];
         p.phases.stage.debug_symbols = false;
         let cmds = build_commands(&p, &env(&eng));
         assert!(cmd(&cmds, "Stage · Pak · Archive").args.contains(&"-nodebuginfo".to_string()));
@@ -990,6 +1121,69 @@ mod tests {
         for f in ["-applocaldirectory=Redist", "-compressionformats=Oodle", "-CrashReporter"] {
             assert!(spa.args.iter().any(|a| a == f), "stage group missing {f}");
         }
+    }
+
+    #[test]
+    fn steam_login_preflight_emitted_before_build() {
+        let eng = engine(EngineKind::Source);
+        // disabled ⇒ no preflight
+        assert!(!build_commands(&dev_profile(), &env(&eng)).iter().any(|c| c.phase == PhaseId::SteamLogin));
+
+        let mut p = dev_profile();
+        p.phases.steam_upload.enabled = true;
+        p.phases.steam_upload.app_id = "480".into();
+        p.phases.steam_upload.depots =
+            vec![crate::profiles::schema::DepotItem { depot_id: "481".into(), path: ".".into() }];
+        let cmds = build_commands(&p, &env(&eng));
+        // the very first emitted unit is the Steam Login preflight
+        assert_eq!(cmds[0].phase, PhaseId::SteamLogin);
+        assert_eq!(cmds[0].label, "Steam Login");
+        for f in ["+login", "builder_bot", "+quit"] {
+            assert!(cmds[0].args.iter().any(|a| a == f), "preflight missing {f}");
+        }
+        assert!(!cmds[0].args.iter().any(|a| a == "+run_app_build"), "preflight must not upload");
+        // and the real upload phase is still emitted (later)
+        assert!(cmds.iter().any(|c| c.phase == PhaseId::SteamUpload));
+    }
+
+    #[test]
+    fn steam_upload_emits_steamcmd_run_app_build() {
+        let eng = engine(EngineKind::Source);
+        // off by default ⇒ no unit
+        let cmds = build_commands(&dev_profile(), &env(&eng));
+        assert!(!cmds.iter().any(|c| c.phase == PhaseId::SteamUpload));
+
+        let mut p = dev_profile();
+        p.phases.steam_upload.enabled = true;
+        p.phases.steam_upload.app_id = "480".into();
+        p.phases.steam_upload.depots =
+            vec![crate::profiles::schema::DepotItem { depot_id: "481".into(), path: ".".into() }];
+        let cmds = build_commands(&p, &env(&eng));
+        let steam = cmd(&cmds, "Upload to Steam");
+        assert_eq!(steam.phase, PhaseId::SteamUpload);
+        assert_eq!(steam.kind, PhaseKind::External);
+        assert_eq!(steam.program.as_deref(), Some("C:/steamcmd/steamcmd.exe"));
+        assert!(steam.args.contains(&"+login".to_string()));
+        assert!(steam.args.contains(&"builder_bot".to_string()));
+        assert!(steam.args.contains(&"+run_app_build".to_string()));
+        assert!(steam.args.contains(&"+quit".to_string()));
+        // the run VDF sits in the git-ignored scratch dir, under the project root
+        assert!(steam.args.iter().any(|a| a.replace('\\', "/").contains(".uep/steam-build-output/dev/app_build.vdf")));
+    }
+
+    #[test]
+    fn steam_upload_gated_off_when_archive_disabled() {
+        let eng = engine(EngineKind::Source);
+        let mut p = dev_profile();
+        p.phases.steam_upload.enabled = true;
+        p.phases.steam_upload.app_id = "480".into();
+        p.phases.steam_upload.depots =
+            vec![crate::profiles::schema::DepotItem { depot_id: "481".into(), path: ".".into() }];
+        // Archive off ⇒ nothing fresh to push ⇒ neither the preflight nor the upload is emitted.
+        p.phases.archive.enabled = false;
+        let cmds = build_commands(&p, &env(&eng));
+        assert!(!cmds.iter().any(|c| c.phase == PhaseId::SteamLogin));
+        assert!(!cmds.iter().any(|c| c.phase == PhaseId::SteamUpload));
     }
 
     #[test]

@@ -109,7 +109,9 @@ pub struct RunSnapshot {
     pub run_id: String,
     pub project: String,
     pub platform: String,
-    pub config: String,
+    /// Every client config staged this run (one or more); shown as tags and recorded
+    /// one-per-config in history. Empty for plugin/commandlet runs.
+    pub configs: Vec<String>,
     pub target: String,
     pub output_dir: String,
     pub started_ms: f64,
@@ -304,7 +306,7 @@ pub struct RunInputs {
     pub output_dir: String,
     pub project: String,
     pub platform: String,
-    pub config: String,
+    pub configs: Vec<String>,
     pub target: String,
     /// Editor target name (for the Clean-up phase's footprint scope), if detected.
     pub editor_target: Option<String>,
@@ -336,7 +338,7 @@ pub fn spawn_run(app: AppHandle, inputs: RunInputs) -> ActiveRun {
         run_id: inputs.run_id.clone(),
         project: inputs.project,
         platform: inputs.platform,
-        config: inputs.config,
+        configs: inputs.configs,
         target: inputs.target.clone(),
         output_dir: inputs.output_dir.clone(),
         started_ms: inputs.started_ms,
@@ -411,7 +413,7 @@ pub fn spawn_plugin_package(app: AppHandle, inputs: PluginPackageInputs) -> Acti
         run_id: inputs.run_id.clone(),
         project: inputs.plugin_name,
         platform: String::new(),
-        config: String::new(),
+        configs: Vec::new(),
         target: String::new(),
         output_dir: inputs.package_dir.clone(),
         started_ms: inputs.started_ms,
@@ -616,7 +618,7 @@ pub fn spawn_commandlet(app: AppHandle, inputs: CommandletInputs) -> ActiveRun {
         run_id: inputs.run_id.clone(),
         project: inputs.project_name,
         platform: String::new(),
-        config: String::new(),
+        configs: Vec::new(),
         target: String::new(),
         output_dir: String::new(), // a commandlet tool produces no output folder
         started_ms: inputs.started_ms,
@@ -934,7 +936,7 @@ fn write_history(ctx: &ExecCtx, total_secs: f64, final_status: RunStatus) {
             output_path: open_path.clone(),
             output_mtime_ms: history::store::mtime_ms(output),
             phases,
-            tags: history::tags::generate(&snap.platform, &snap.config, &snap.target, run_status_label(final_status)),
+            tags: history::tags::generate(&snap.platform, &snap.configs, &snap.target, run_status_label(final_status)),
         };
         (record, log, phase_idx)
     };
@@ -986,12 +988,84 @@ async fn run_external(ctx: &ExecCtx, cancel_rx: &mut watch::Receiver<bool>, inde
     let program = unit.program.clone().unwrap_or_default();
     emit_line(ctx, index, Severity::Info, &format!("▶ {}", unit.preview));
 
+    // Steam login preflight (emitted before Build when the upload phase is on): sign in up
+    // front so an interactive login never interrupts a finished build. The account is the
+    // `+login <account>` value in the args. If a session is already cached we're done; if not,
+    // open steamcmd in its own console for the user to sign in (code / phone approval); it
+    // `+quit`s and closes, then the build continues. The later upload phase assumes this ran.
+    if unit.phase == PhaseId::SteamLogin {
+        use crate::steam::login::SteamLoginStatus;
+        let account = login_account(&unit.args);
+        if account.is_empty() {
+            emit_line(ctx, index, Severity::Error, "Steam upload needs an account name - set it in Setup SteamCMD.");
+            return PhaseStatus::Failed;
+        }
+        emit_line(ctx, index, Severity::Info, "Checking Steam sign-in...");
+        match steam_session_check(ctx, cancel_rx, &program, account).await {
+            None => {
+                emit_line(ctx, index, Severity::Warning, "cancelled");
+                return PhaseStatus::Cancelled;
+            }
+            Some(r) if r.status == SteamLoginStatus::Success => {
+                emit_line(ctx, index, Severity::Info, "Already signed in to Steam.");
+                return PhaseStatus::Success;
+            }
+            Some(_) => {} // no cached session - open the interactive console below
+        }
+        emit_line(
+            ctx,
+            index,
+            Severity::Info,
+            "Not signed in - steamcmd is opening in its own window. Sign in there (enter the code, or approve on your phone); it closes automatically and the build continues.",
+        );
+        // steamcmd's console reports only its exit code, which is 0 even on an aborted/failed
+        // login. Re-verify that a session was actually cached before letting the build (30+ min)
+        // proceed - otherwise the piped upload phase would be the first to notice, far too late.
+        let console = run_in_console(ctx, cancel_rx, index, &program, &unit.args).await;
+        if console != PhaseStatus::Success {
+            return console; // cancelled, or steamcmd failed to launch
+        }
+        emit_line(ctx, index, Severity::Info, "Confirming Steam sign-in...");
+        return match steam_session_check(ctx, cancel_rx, &program, account).await {
+            None => {
+                emit_line(ctx, index, Severity::Warning, "cancelled");
+                PhaseStatus::Cancelled
+            }
+            Some(r) if r.status == SteamLoginStatus::Success => {
+                emit_line(ctx, index, Severity::Info, "Signed in to Steam.");
+                PhaseStatus::Success
+            }
+            Some(r) => {
+                emit_line(
+                    ctx,
+                    index,
+                    Severity::Error,
+                    &format!("Steam sign-in was not completed, so the build was stopped before packaging. {}", r.message.trim()),
+                );
+                PhaseStatus::Failed
+            }
+        };
+    }
+
     // UAT's `-archive` copies files into the archive dir but never wipes it (no
     // clean-archive flag exists), so a build landing on an existing path would keep
     // stale files from a prior run. Clear it up front - but only for the unit that
     // actually archives (Stage·Pak·Archive with Archive on).
     if unit.phase == PhaseId::Stage && ctx.profile.phases.archive.enabled {
         clean_archive_dir(ctx, index).await;
+    }
+
+    // Steam upload's app-owned pre-step: materialize the resolved VDF (ContentRoot +
+    // BuildOutput injected) into the scratch dir the steamcmd `+run_app_build` points at, then
+    // upload **piped** (streamed to the Build Logs). Sign-in was handled up front by the Steam
+    // Login preflight, so we do NOT open a console this late: if the session somehow isn't
+    // valid here, steamcmd exits non-zero and the phase just fails.
+    if unit.phase == PhaseId::SteamUpload {
+        emit_line(ctx, index, Severity::Info, "Preparing Steam build scripts...");
+        if let Err(e) = crate::steam::vdf::resolve_run_vdf(Path::new(&ctx.project_root), &ctx.profile, &ctx.output_dir) {
+            emit_line(ctx, index, Severity::Error, &format!("could not prepare Steam build scripts: {e}"));
+            return PhaseStatus::Failed;
+        }
     }
 
     let mut cmd = build_command(&program, &unit.args, &ctx.project_root);
@@ -1037,6 +1111,112 @@ async fn run_external(ctx: &ExecCtx, cancel_rx: &mut watch::Receiver<bool>, inde
         Ok(status) => {
             let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated".into());
             emit_line(ctx, index, Severity::Error, &format!("phase exited with code {code}"));
+            PhaseStatus::Failed
+        }
+        Err(e) => {
+            emit_line(ctx, index, Severity::Error, &format!("process error: {e}"));
+            PhaseStatus::Failed
+        }
+    }
+}
+
+/// The `+login <account>` value from a steamcmd arg vector (trimmed; empty if absent).
+fn login_account(args: &[String]) -> &str {
+    args.iter()
+        .position(|a| a == "+login")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.trim())
+        .unwrap_or("")
+}
+
+/// The Steam Login preflight's **cancellable** session check: spawn `steamcmd +login <account>
+/// +quit` via the shared [`login::build_verify_command`], adopt it into the process group, and
+/// race it against Cancel and a timeout, classifying the captured output. Returns `None` when
+/// cancelled. Unlike the standalone `login::verify`, the child is adopted (so app-exit tears it
+/// down) and interruptible - steamcmd's first run self-updates and can take minutes, and it must
+/// never be left orphaned when the user cancels or closes the app.
+async fn steam_session_check(
+    ctx: &ExecCtx,
+    cancel_rx: &mut watch::Receiver<bool>,
+    program: &str,
+    account: &str,
+) -> Option<crate::steam::login::SteamLoginResult> {
+    use crate::steam::login;
+    let mut cmd = login::build_verify_command(program, account);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(login::SteamLoginResult {
+                status: login::SteamLoginStatus::Failed,
+                message: format!("could not launch steamcmd: {e}"),
+            })
+        }
+    };
+    // Adopt for app-exit teardown; `kill_on_drop` (set by build_verify_command) covers the
+    // Cancel/timeout branches, where dropping the wait future drops the child.
+    ctx.proc_group.adopt(&child);
+    tokio::select! {
+        out = child.wait_with_output() => match out {
+            Ok(o) => Some(login::classify_output(&o.stdout, &o.stderr)),
+            Err(e) => Some(login::SteamLoginResult {
+                status: login::SteamLoginStatus::Failed,
+                message: format!("steamcmd error: {e}"),
+            }),
+        },
+        _ = cancel_rx.changed() => None,
+        _ = tokio::time::sleep(login::LOGIN_TIMEOUT) => Some(login::SteamLoginResult {
+            status: login::SteamLoginStatus::Failed,
+            message: "steamcmd timed out".to_string(),
+        }),
+    }
+}
+
+/// Run a child (steamcmd) in its **own interactive console** so the user can sign in there
+/// (password / Steam Guard / mobile-app confirmation) - used by the Steam Login preflight when
+/// there's no cached session. Not piped, so its output shows in that window rather than the
+/// Build Logs; we just wait for the exit code (honoring Cancel). Windows-first: other
+/// platforms spawn without a dedicated console.
+async fn run_in_console(ctx: &ExecCtx, cancel_rx: &mut watch::Receiver<bool>, index: u32, program: &str, args: &[String]) -> PhaseStatus {
+    let mut cmd = tokio::process::Command::new(program);
+    for a in args {
+        cmd.arg(a);
+    }
+    if !ctx.project_root.is_empty() {
+        cmd.current_dir(&ctx.project_root);
+    }
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE - its own interactive window
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            emit_line(ctx, index, Severity::Error, &format!("failed to launch steamcmd: {e}"));
+            return PhaseStatus::Failed;
+        }
+    };
+    // Adopt into the job so Cancel / app-exit tear down the login window too.
+    ctx.proc_group.adopt(&child);
+    let mut killed = false;
+    let wait = tokio::select! {
+        res = child.wait() => res,
+        _ = cancel_rx.changed() => {
+            killed = true;
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    };
+    if killed || *cancel_rx.borrow() {
+        emit_line(ctx, index, Severity::Warning, "cancelled");
+        return PhaseStatus::Cancelled;
+    }
+    match wait {
+        Ok(s) if s.success() => {
+            emit_line(ctx, index, Severity::Info, "steamcmd finished.");
+            PhaseStatus::Success
+        }
+        Ok(s) => {
+            let code = s.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated".into());
+            emit_line(ctx, index, Severity::Error, &format!("steamcmd exited with code {code}"));
             PhaseStatus::Failed
         }
         Err(e) => {

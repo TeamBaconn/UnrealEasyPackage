@@ -1,6 +1,6 @@
 [package]
 name = "unrealeasypackage"
-version = "0.1.0"
+version = "0.2.0"
 description = "Saveable, reusable build profiles for Unreal Engine projects."
 authors = ["TeamBaconn"]
 license = "MIT"

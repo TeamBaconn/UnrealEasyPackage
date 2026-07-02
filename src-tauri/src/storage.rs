@@ -179,6 +179,42 @@ pub fn save_plugin_settings(plugin_root: &Path, settings: &PluginSettings) -> st
     write_json(&plugin_settings_file(plugin_root), settings)
 }
 
+// ── per-project machine-local Steam settings (`.uep/steam-config/local.json`) ─────
+// The steamcmd path + build account for the Steam upload phase. Machine-local (git-
+// ignored) - they pair with steamcmd's cached session on THIS machine and never belong in
+// the committed profile/VDFs. The account is remembered after a successful in-app login so
+// uploads can `+login <account>` non-interactively; the password/Steam Guard code are never
+// stored.
+
+/// The Steam upload phase's machine-local settings (one JSON beside the committed VDFs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamLocalSettings {
+    /// Absolute path to the user's `steamcmd.exe`.
+    #[serde(default)]
+    pub steamcmd_path: String,
+    /// Steam build account name (its cached session powers uploads).
+    #[serde(default)]
+    pub account: String,
+}
+
+fn steam_local_settings_file(project_root: &Path) -> PathBuf {
+    project_root.join(".uep").join("steam-config").join("local.json")
+}
+
+/// Load the project's Steam settings (`.uep/steam-config/local.json`), defaults if absent.
+pub fn load_steam_local_settings(project_root: &Path) -> SteamLocalSettings {
+    read_json(&steam_local_settings_file(project_root))
+}
+
+/// Persist the project's Steam settings. Ensures `.uep/.gitignore` covers
+/// `steam-config/local.json` first, so the machine-local file is never committed (the
+/// `steam-config/*.vdf` build config stays committed).
+pub fn save_steam_local_settings(project_root: &Path, settings: &SteamLocalSettings) -> std::io::Result<()> {
+    let _ = ensure_uep_dir(project_root);
+    write_json(&steam_local_settings_file(project_root), settings)
+}
+
 // ── per-project `.uep/` scaffolding ──────────────────────────────────────────
 
 /// Contents of the managed `.uep/.gitignore` (`docs/data-storage.md` §"Per-project").
@@ -188,16 +224,19 @@ pub fn save_plugin_settings(plugin_root: &Path, settings: &PluginSettings) -> st
 /// regenerates it locally on open (git still honors an ignored `.gitignore`).
 const UEP_GITIGNORE: &str = "\
 # Managed by UnrealEasyPackage - regenerated locally on open, don't commit it.
-# Only profiles/ is shared; everything else here is derived or machine-local.
+# Only profiles/ + steam-config/*.vdf are shared; everything else here is derived or machine-local.
 .gitignore
 history/
 cache/
 local.json
+steam-build-output/
+steam-config/local.json
 ";
 
 /// Lines `ensure_uep_dir` guarantees exist even in a pre-existing `.gitignore`
 /// (rules added after the original scaffold). Keeps user edits intact.
-const UEP_GITIGNORE_REQUIRED: &[&str] = &[".gitignore", "history/", "cache/", "local.json"];
+const UEP_GITIGNORE_REQUIRED: &[&str] =
+    &[".gitignore", "history/", "cache/", "local.json", "steam-build-output/", "steam-config/local.json"];
 
 /// Ensure `<project>/.uep/` exists with the managed `.gitignore`. Idempotent and
 /// non-destructive: a fresh dir gets the full file; an existing `.gitignore` keeps
@@ -337,6 +376,30 @@ mod tests {
         // The override file is git-ignored by the scaffolded `.uep/.gitignore`.
         let gi = std::fs::read_to_string(a.join(".uep").join(".gitignore")).unwrap();
         assert!(gi.lines().any(|l| l.trim() == "local.json"));
+    }
+
+    #[test]
+    fn steam_settings_roundtrip_and_gitignored() {
+        let d = tempdir().unwrap();
+        let root = d.path();
+        assert!(load_steam_local_settings(root).steamcmd_path.is_empty());
+
+        let s = SteamLocalSettings {
+            steamcmd_path: "C:/steamcmd/steamcmd.exe".into(),
+            account: "builder_bot".into(),
+        };
+        save_steam_local_settings(root, &s).unwrap();
+        let back = load_steam_local_settings(root);
+        assert_eq!(back.steamcmd_path, "C:/steamcmd/steamcmd.exe");
+        assert_eq!(back.account, "builder_bot");
+
+        // Machine-local: the scratch dir + this file are git-ignored, but the shared
+        // steam-config/*.vdf build config is NOT.
+        assert!(root.join(".uep").join("steam-config").join("local.json").exists());
+        let gi = std::fs::read_to_string(root.join(".uep").join(".gitignore")).unwrap();
+        assert!(gi.lines().any(|l| l.trim() == "steam-build-output/"));
+        assert!(gi.lines().any(|l| l.trim() == "steam-config/local.json"));
+        assert!(!gi.lines().any(|l| l.trim() == "steam-config/"));
     }
 
     #[test]

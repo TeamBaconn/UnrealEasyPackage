@@ -78,6 +78,27 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The open project's root, or `None` when none is open. Owned (guard dropped) so callers
+/// can hold it across an `await`.
+fn open_project_root(state: &State<AppState>) -> Option<String> {
+    state.current.read().unwrap().as_ref().map(|p| p.project_root.clone())
+}
+
+/// Resolve a stored machine-local path to an absolute one against the project root. A
+/// project-relative path (`./Tools/steamcmd/steamcmd.exe`) is joined under the root; an
+/// absolute or empty path passes through unchanged. Mirrors the arg-builder's base-dir rule
+/// so a path inside the project can be stored relative (portable if the project moves) yet
+/// still resolves for spawning.
+fn resolve_local_path(project_root: &str, stored: &str) -> String {
+    let s = stored.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Reuse the arg-builder's project-relative anchoring (`resolve_under_root`) so a
+    // machine-local path and the output base dir can never resolve by different rules.
+    crate::unreal::args::resolve_under_root(Path::new(project_root), s).display().to_string()
+}
+
 #[derive(Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectValidation {
@@ -453,7 +474,16 @@ pub fn save_profile(state: State<AppState>, profile: BuildConfig) -> Result<(), 
     profile
         .validate_profile()
         .map_err(|errs| AppError::Validation(errs.join("\n")))?;
-    store::save(&profiles_dir(&state)?, &profile).map_err(|e| AppError::Io(e.to_string()))
+    store::save(&profiles_dir(&state)?, &profile).map_err(|e| AppError::Io(e.to_string()))?;
+    // When the Steam upload phase is on, (re)generate the committed VDFs from the profile's
+    // managed fields, preserving any custom keys the user added. Best-effort - a VDF hiccup
+    // must not fail the save (the profile JSON is the source of truth for the managed fields).
+    if profile.phases.steam_upload.enabled {
+        if let Some(root) = open_project_root(&state) {
+            let _ = crate::steam::vdf::write_committed_vdf(Path::new(&root), &profile);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -545,6 +575,8 @@ pub fn preview_profile(
     let date = now.format("%Y%m%d").to_string();
     let time = now.format("%H%M%S").to_string();
 
+    let steam = storage::load_steam_local_settings(Path::new(&proj.project_root));
+    let steamcmd = resolve_local_path(&proj.project_root, &steam.steamcmd_path);
     let env = BuildEnv {
         uproject_path: &proj.uproject_path,
         project_name: &proj.name,
@@ -554,6 +586,8 @@ pub fn preview_profile(
         editor_target: editor_target.as_deref(),
         date: &date,
         time: &time,
+        steamcmd_path: &steamcmd,
+        steam_account: &steam.account,
     };
     Ok(args::build_commands(&profile, &env))
 }
@@ -630,6 +664,20 @@ pub fn start_build(
         let date = now.format("%Y%m%d").to_string();
         let time = now.format("%H%M%S").to_string();
 
+        let steam = storage::load_steam_local_settings(Path::new(&proj.project_root));
+        if profile.phases.steam_upload.enabled {
+            if steam.steamcmd_path.trim().is_empty() {
+                return Err(AppError::Validation(
+                    "Steam upload is enabled but no steamcmd path is set - set it in the Steam upload settings.".into(),
+                ));
+            }
+            if steam.account.trim().is_empty() {
+                return Err(AppError::Validation(
+                    "Steam upload is enabled but you're not logged in to Steam - log in first.".into(),
+                ));
+            }
+        }
+        let steamcmd = resolve_local_path(&proj.project_root, &steam.steamcmd_path);
         let env = BuildEnv {
             uproject_path: &proj.uproject_path,
             project_name: &proj.name,
@@ -639,6 +687,8 @@ pub fn start_build(
             editor_target: editor_target.as_deref(),
             date: &date,
             time: &time,
+            steamcmd_path: &steamcmd,
+            steam_account: &steam.account,
         };
         (
             args::build_commands(&profile, &env),
@@ -652,7 +702,11 @@ pub fn start_build(
 
     let run_id = gen_id(&format!("build-{}", profile.name));
     let platform = profile.platform.uat().to_string();
-    let config = profile.config.as_str().to_string();
+    let configs = profile
+        .staged_configs()
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect::<Vec<_>>();
     let active = spawn_run(
         app,
         RunInputs {
@@ -663,7 +717,7 @@ pub fn start_build(
             output_dir,
             project,
             platform,
-            config,
+            configs,
             target,
             editor_target,
             started_ms: now_ms(),
@@ -732,6 +786,9 @@ pub fn check_output(state: State<AppState>, profile: BuildConfig) -> Result<Outp
         editor_target: editor_target.as_deref(),
         date: &date,
         time: &time,
+        // Steam fields unused here (only resolved_output_dir is called, not build_commands).
+        steamcmd_path: "",
+        steam_account: "",
     };
     let path = args::resolved_output_dir(&profile, &env);
     let exists = Path::new(&path).exists();
@@ -1434,6 +1491,91 @@ pub fn start_validate(
     launch_commandlet(app, state, "Validate Assets", move |engine, uproject| {
         args::build_validate_command(engine, uproject, !options.skip_engine_content, &options.asset_type)
     })
+}
+
+// ── Steam upload (steamcmd) ──────────────────────────────────────────────────────
+//
+// The Steam upload phase's machine-local settings (steamcmd path + build account) live in
+// `<project>/.uep/steam-config/local.json` (git-ignored), separate from the committed
+// profile/VDFs. `steam_login` runs steamcmd's interactive login once so it caches a session
+// for non-interactive uploads; the password + Steam Guard code are transient (never stored).
+
+/// The open project's machine-local Steam settings (steamcmd path + build account).
+#[tauri::command]
+#[specta::specta]
+pub fn load_steam_settings(state: State<AppState>) -> Result<storage::SteamLocalSettings, AppError> {
+    let root = open_project_root(&state).ok_or_else(|| AppError::Io("no project is open".into()))?;
+    Ok(storage::load_steam_local_settings(Path::new(&root)))
+}
+
+/// Persist the open project's machine-local Steam settings (git-ignored `local.json`).
+#[tauri::command]
+#[specta::specta]
+pub fn save_steam_settings(
+    state: State<AppState>,
+    settings: storage::SteamLocalSettings,
+) -> Result<(), AppError> {
+    let root = open_project_root(&state).ok_or_else(|| AppError::Io("no project is open".into()))?;
+    storage::save_steam_local_settings(Path::new(&root), &settings).map_err(|e| AppError::Io(e.to_string()))
+}
+
+/// Setup status for the "Setup SteamCMD" modal: whether steamcmd is found at the saved path,
+/// and whether it can sign in (a cached session for the saved account). The sign-in check runs
+/// `steamcmd +login <account> +quit` (no password), so it can be slow on steamcmd's first run.
+#[derive(Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamStatus {
+    pub steamcmd_found: bool,
+    pub logged_in: bool,
+    pub message: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn steam_status(state: State<'_, AppState>) -> Result<SteamStatus, AppError> {
+    let root = open_project_root(&state).ok_or_else(|| AppError::Io("no project is open".into()))?;
+    let steam = storage::load_steam_local_settings(Path::new(&root));
+    let resolved = resolve_local_path(&root, &steam.steamcmd_path);
+    let found = !resolved.trim().is_empty() && Path::new(&resolved).exists();
+    if !found {
+        let message = if steam.steamcmd_path.trim().is_empty() {
+            "steamcmd path not set.".to_string()
+        } else {
+            format!("steamcmd.exe not found at {resolved}")
+        };
+        return Ok(SteamStatus { steamcmd_found: false, logged_in: false, message });
+    }
+    if steam.account.trim().is_empty() {
+        return Ok(SteamStatus {
+            steamcmd_found: true,
+            logged_in: false,
+            message: "Set the build account to check sign-in.".to_string(),
+        });
+    }
+    let logged_in = crate::steam::login::verify(&resolved, steam.account.trim()).await.status
+        == crate::steam::login::SteamLoginStatus::Success;
+    // The modal composes "Signed in as <account>" from the account itself, so no message when OK.
+    let message = if logged_in {
+        String::new()
+    } else {
+        "You'll sign in at the build's Steam Login step.".to_string()
+    };
+    Ok(SteamStatus { steamcmd_found: true, logged_in, message })
+}
+
+/// Open steamcmd in its own console for an interactive sign-in - the Setup modal's "Try sign
+/// in" link. Fire-and-forget; the user signs in there, then re-checks status.
+#[tauri::command]
+#[specta::specta]
+pub fn steam_open_login_terminal(state: State<AppState>) -> Result<(), AppError> {
+    let root = open_project_root(&state).ok_or_else(|| AppError::Io("no project is open".into()))?;
+    let steam = storage::load_steam_local_settings(Path::new(&root));
+    if steam.steamcmd_path.trim().is_empty() {
+        return Err(AppError::Validation("Set the steamcmd path first.".into()));
+    }
+    let steamcmd = resolve_local_path(&root, &steam.steamcmd_path);
+    crate::steam::login::open_login_terminal(&steamcmd, steam.account.trim())
+        .map_err(|e| AppError::Io(e.to_string()))
 }
 
 // ── Remove UnrealEasyPackage from a project / plugin ─────────────────────────────

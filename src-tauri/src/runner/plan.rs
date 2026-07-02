@@ -31,6 +31,14 @@ fn is_editor_build(c: &PhaseCommand) -> bool {
 pub fn plan(units: &[PhaseCommand]) -> Vec<Stage> {
     let mut stages: Vec<Stage> = Vec::new();
 
+    // ⓪ Steam login preflight - front-loaded so an interactive sign-in (if needed) happens
+    //    before the (long) build, never after it.
+    for (i, c) in units.iter().enumerate() {
+        if c.phase == PhaseId::SteamLogin {
+            stages.push(Stage { units: vec![i] });
+        }
+    }
+
     // ① the editor build(s) first - cooking needs a built editor (C++ only).
     for (i, c) in units.iter().enumerate() {
         if is_editor_build(c) {
@@ -38,10 +46,19 @@ pub fn plan(units: &[PhaseCommand]) -> Vec<Stage> {
         }
     }
 
-    // ② the one real overlap: game build ∥ cook (both after the editor exists).
-    let game_build = units.iter().position(|c| c.phase == PhaseId::Build && !is_editor_build(c));
-    let cook = units.iter().position(|c| c.phase == PhaseId::Cook);
-    let overlap: Vec<usize> = [game_build, cook].into_iter().flatten().collect();
+    // ② the one real overlap: ALL game builds ∥ cook (all after the editor exists).
+    //    Multi-config emits one game build per config; they share this stage and
+    //    serialize at UBT's -WaitMutex, while cook (-skipbuild) overlaps freely.
+    //    (A first-match `position()` here would strand the extra builds unscheduled.)
+    let mut overlap: Vec<usize> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.phase == PhaseId::Build && !is_editor_build(c))
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(cook) = units.iter().position(|c| c.phase == PhaseId::Cook) {
+        overlap.push(cook);
+    }
     if !overlap.is_empty() {
         stages.push(Stage { units: overlap });
     }
@@ -50,7 +67,7 @@ pub fn plan(units: &[PhaseCommand]) -> Vec<Stage> {
     //    barrier, in emitted order.
     for (i, c) in units.iter().enumerate() {
         match c.phase {
-            PhaseId::Stage | PhaseId::CopyExtras | PhaseId::Cleanup => {
+            PhaseId::Stage | PhaseId::CopyExtras | PhaseId::SteamUpload | PhaseId::Cleanup => {
                 stages.push(Stage { units: vec![i] })
             }
             _ => {}
@@ -124,6 +141,26 @@ mod tests {
     }
 
     #[test]
+    fn multi_config_builds_share_one_overlap_stage() {
+        // primary + one extra => two game builds; both must land in the game/cook
+        // overlap stage (not stranded), so Stage runs only after all binaries exist.
+        let u = vec![
+            unit(PhaseId::Build, "Build (Editor)"),
+            unit(PhaseId::Build, "Build (DebugGame)"),
+            unit(PhaseId::Build, "Build (Shipping)"),
+            unit(PhaseId::Cook, "Cook"),
+            unit(PhaseId::Stage, "Stage · Pak · Archive"),
+        ];
+        let s = plan(&u);
+        // editor(0) | [dbg, ship, cook](1,2,3) | stage(4)
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].units, vec![0]);
+        assert_eq!(s[1].units, vec![1, 2, 3]);
+        assert_eq!(s[2].units, vec![4]);
+        assert_eq!(levels(&u), vec![0, 1, 1, 1, 2]);
+    }
+
+    #[test]
     fn blueprint_has_no_editor_build_but_still_overlaps() {
         let u = vec![
             unit(PhaseId::Build, "Build"),
@@ -134,6 +171,45 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].units, vec![0, 1]); // build ∥ cook from the start
         assert_eq!(s[1].units, vec![2]);
+    }
+
+    #[test]
+    fn steam_login_preflight_is_the_first_stage() {
+        let u = vec![
+            unit(PhaseId::SteamLogin, "Steam Login"),
+            unit(PhaseId::Build, "Build (Editor)"),
+            unit(PhaseId::Build, "Build"),
+            unit(PhaseId::Cook, "Cook"),
+            unit(PhaseId::Stage, "Stage · Pak · Archive"),
+            unit(PhaseId::SteamUpload, "Upload to Steam"),
+        ];
+        let s = plan(&u);
+        // login(0) | editor(1) | game∥cook(2,3) | stage(4) | upload(5)
+        assert_eq!(s[0].units, vec![0]); // preflight is the very first stage
+        assert_eq!(levels(&u)[0], 0);
+        assert_eq!(s[1].units, vec![1]); // editor build follows
+        assert_eq!(s[2].units, vec![2, 3]); // game ∥ cook
+    }
+
+    #[test]
+    fn steam_upload_gets_its_own_stage_after_copy_extras() {
+        let u = vec![
+            unit(PhaseId::Build, "Build"),
+            unit(PhaseId::Cook, "Cook"),
+            unit(PhaseId::Stage, "Stage · Pak · Archive"),
+            unit(PhaseId::CopyExtras, "Copy Extras"),
+            unit(PhaseId::SteamUpload, "Upload to Steam"),
+            unit(PhaseId::Cleanup, "Clean-up"),
+        ];
+        let s = plan(&u);
+        // build∥cook | stage | copyExtras | steamUpload | cleanup
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0].units, vec![0, 1]);
+        assert_eq!(s[2].units, vec![3]); // copy extras
+        assert_eq!(s[3].units, vec![4]); // steam upload (its own barrier, after copy extras)
+        assert_eq!(s[4].units, vec![5]); // clean-up last
+        // steamcmd is an external unit
+        assert_eq!(u[4].kind, PhaseKind::External);
     }
 
     #[test]

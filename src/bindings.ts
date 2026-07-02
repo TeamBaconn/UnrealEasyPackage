@@ -121,7 +121,11 @@ export const commands = {
 	runId: string,
 	project: string,
 	platform: string,
-	config: string,
+	/**
+	 *  Every client config staged this run (one or more); shown as tags and recorded
+	 *  one-per-config in history. Empty for plugin/commandlet runs.
+	 */
+	configs: string[],
 	target: string,
 	outputDir: string,
 	startedMs: number | null,
@@ -251,6 +255,16 @@ export const commands = {
 	 *  asset validators. Returns the run id; progress arrives via `uep://run-*`.
 	 */
 	startValidate: (options: ValidateOptions) => typedError<string, AppError>(__TAURI_INVOKE("start_validate", { options })),
+	/**  The open project's machine-local Steam settings (steamcmd path + build account). */
+	loadSteamSettings: () => typedError<SteamLocalSettings, AppError>(__TAURI_INVOKE("load_steam_settings")),
+	/**  Persist the open project's machine-local Steam settings (git-ignored `local.json`). */
+	saveSteamSettings: (settings: SteamLocalSettings) => typedError<null, AppError>(__TAURI_INVOKE("save_steam_settings", { settings })),
+	steamStatus: () => typedError<SteamStatus, AppError>(__TAURI_INVOKE("steam_status")),
+	/**
+	 *  Open steamcmd in its own console for an interactive sign-in - the Setup modal's "Try sign
+	 *  in" link. Fire-and-forget; the user signs in there, then re-checks status.
+	 */
+	steamOpenLoginTerminal: () => typedError<null, AppError>(__TAURI_INVOKE("steam_open_login_terminal")),
 	/**
 	 *  Delete the open project's `.uep/` (or open plugin's `.uap/`), forget its recent, and
 	 *  clear it from managed state. The gate opens a project XOR a plugin; project takes
@@ -310,7 +324,14 @@ export type BuildConfig = {
 	id: string,
 	name: string,
 	platform?: Platform,
-	config?: Configuration,
+	/**
+	 *  Client configs to build AND stage into the one package (e.g. Development +
+	 *  Shipping): one cook, one exe per config. Non-empty (enforced by
+	 *  `validate_profile`). Every config becomes its own history tag; the `{config}`
+	 *  token joins them with `+`; the cook uses just the first (it is config-agnostic).
+	 *  `staged_configs()` returns them deduped and in canonical order.
+	 */
+	configs?: Configuration[],
 	/**  Project-specific (`None` in templates). */
 	target?: string | null,
 	phases?: Phases,
@@ -371,7 +392,12 @@ export type CleanOutcome = {
  *  is editor-safe (build only); `IntermediateOther` is what forces a full editor recompile,
  *  so it stays out of the auto Clean-up phase.
  */
-export type CleanupCategory = "staged" | "cooked" | "shader" | "binariesGame" | "binariesPlugin" | "intermediateGame" | "intermediateOther" | "intermediatePlugin" | "derivedData";
+export type CleanupCategory = "staged" | "cooked" | "shader" | "binariesGame" | "binariesPlugin" | "intermediateGame" | "intermediateOther" | "intermediatePlugin" | "derivedData" | 
+/**
+ *  The Steam upload scratch dir (`.uep/steam-build-output/`) - steamcmd's chunk
+ *  cache + logs + resolved run VDFs. Regenerable; safe to wipe.
+ */
+"steamBuildOutput";
 
 export type CleanupCfg = {
 	enabled?: boolean,
@@ -437,6 +463,19 @@ export type CreateTemplateRequest = {
 	name: string,
 	/**  Source template id to clone (a fixed built-in, or any user template). */
 	sourceId: string,
+};
+
+/**
+ *  One Steam depot to upload. Mirrors the `CopyItem` shape so the editor reuses the
+ *  Copy-Extras list editor. The `path` is the depot's content-root-relative source
+ *  root (default `"."` = the whole archive tree), rendered into the depot VDF's
+ *  `FileMapping` `LocalPath` when the depot template is first created.
+ */
+export type DepotItem = {
+	/**  Steam depot id (numeric string, e.g. `"481"`). */
+	depotId: string,
+	/**  Content-root-relative source root (default `"."`). */
+	path?: string,
 };
 
 /**
@@ -650,7 +689,14 @@ export type PhaseCommand = {
  *  TS phase keys (one source of truth; the frontend indexes phase config by this id
  *  with no mapping). The human-facing name lives in `PhaseInfo::label`, not here.
  */
-export type PhaseId = "build" | "cook" | "stage" | "pak" | "archive" | "copyExtras" | "cleanup";
+export type PhaseId = "build" | "cook" | "stage" | "pak" | "archive" | "copyExtras" | "steamUpload" | "cleanup" | 
+/**
+ *  Implicit Steam sign-in **preflight** - emitted before Build (only when the Steam upload
+ *  phase is enabled) so an interactive login happens up front, not after a finished build.
+ *  Not a registry phase / editor toggle (like the implicit editor build); it exists only
+ *  as an emitted execution unit + graph node.
+ */
+"steamLogin";
 
 /**  Serializable view of a registry entry (for the editor over IPC). */
 export type PhaseInfo = {
@@ -734,6 +780,8 @@ export type Phases = {
 	pak?: PakCfg,
 	archive?: ArchiveCfg,
 	copyExtras?: CopyExtrasCfg,
+	/**  Upload the archived build to Steam (runs after Copy Extras). Off by default. */
+	steamUpload?: SteamUploadCfg,
 	cleanup?: CleanupCfg,
 };
 
@@ -865,7 +913,11 @@ export type RunSnapshot = {
 	runId: string,
 	project: string,
 	platform: string,
-	config: string,
+	/**
+	 *  Every client config staged this run (one or more); shown as tags and recorded
+	 *  one-per-config in history. Empty for plugin/commandlet runs.
+	 */
+	configs: string[],
 	target: string,
 	outputDir: string,
 	startedMs: number | null,
@@ -910,6 +962,52 @@ export type StageCfg = {
 	separateDebugInfo?: boolean,
 	/**  Verbatim args merged into the shared Stage·Pak·Archive command. */
 	additionalArgs?: string,
+};
+
+/**  The Steam upload phase's machine-local settings (one JSON beside the committed VDFs). */
+export type SteamLocalSettings = {
+	/**  Absolute path to the user's `steamcmd.exe`. */
+	steamcmdPath?: string,
+	/**  Steam build account name (its cached session powers uploads). */
+	account?: string,
+};
+
+/**
+ *  Setup status for the "Setup SteamCMD" modal: whether steamcmd is found at the saved path,
+ *  and whether it can sign in (a cached session for the saved account). The sign-in check runs
+ *  `steamcmd +login <account> +quit` (no password), so it can be slow on steamcmd's first run.
+ */
+export type SteamStatus = {
+	steamcmdFound: boolean,
+	loggedIn: boolean,
+	message: string,
+};
+
+/**
+ *  Upload-to-Steam phase (`docs/build-commands.md` §11). Opt-in (default off) like the
+ *  other post-archive app phases. These are the **managed** fields written into the
+ *  committed `app_build.vdf` (`AppID`/`Desc`/`Preview`/`SetLive` + the depot list);
+ *  unknown user-added VDF keys are preserved on regeneration. `ContentRoot`/`BuildOutput`
+ *  are injected at run, never stored here; steamcmd path + build account are machine-local
+ *  (`storage::SteamLocalSettings`), not in the committed profile.
+ */
+export type SteamUploadCfg = {
+	enabled?: boolean,
+	/**  Steam application id (numeric string). */
+	appId?: string,
+	/**  Build description (visible only in your Steamworks builds page). */
+	description?: string,
+	/**
+	 *  `SetLive` beta branch, or empty (upload only). Never the public `default` branch
+	 *  (Steam blocks that from scripts).
+	 */
+	branch?: string,
+	/**
+	 *  `"Preview" "1"` dry-run: validate + build the manifest without uploading. Default
+	 *  **off** (a normal build uploads for real); turn it on for a dry run.
+	 */
+	preview?: boolean,
+	depots?: DepotItem[],
 };
 
 export type TargetInfo = {

@@ -19,6 +19,7 @@ const CAT: Record<CleanupCategory, { label: string; slowRegen?: boolean }> = {
   intermediateOther: { label: "Intermediate · Other", slowRegen: true },
   intermediatePlugin: { label: "Intermediate · Plugin" },
   derivedData: { label: "Derived data cache", slowRegen: true },
+  steamBuildOutput: { label: "Steam build output", slowRegen: true },
 };
 const CAT_ORDER: CleanupCategory[] = [
   "staged",
@@ -30,6 +31,7 @@ const CAT_ORDER: CleanupCategory[] = [
   "intermediateOther",
   "intermediatePlugin",
   "derivedData",
+  "steamBuildOutput",
 ];
 
 // tree layout
